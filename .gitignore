@@ -51,3 +51,10 @@ private/
 
 # CLAUDE.md — LLM-specific config must not be tracked (config#2581)
 /CLAUDE.md
+
+# Agent operating instructions — local-only.
+# nous-ergon-ops/policies/repository-tiering-policy.md §5.3: these describe how WE
+# work, not how a contributor gets started. Contributor-facing guidance belongs in
+# CONTRIBUTING.md. Public repos keep these out of git by default.
+/AGENTS.md
+/CLAUDE.md
