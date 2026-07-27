@@ -48,3 +48,6 @@ private/
 # source of truth is the PRIVATE alpha-engine-config repo at
 # apps/morning-signal/iam/ — account-scoped IAM is kept out of this public repo.
 .iam-staging/
+
+# CLAUDE.md — LLM-specific config must not be tracked (config#2581)
+/CLAUDE.md
