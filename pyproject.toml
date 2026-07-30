@@ -75,7 +75,14 @@ dependencies = [
     # despite the morning-signal#119 tier-3 forced-search last-resort
     # existing specifically to catch it. Both failure classes now raise a
     # properly-typed LLMError so the existing cascade engages correctly.
-    "krepis[anthropic,openai]>=0.16.2",
+    # Upper bound is load-bearing, not caution. krepis added a REQUIRED
+    # keyword-only `callsite_id` to LLMClient after 0.24.0, and because this
+    # was an open `>=` range every fresh resolve broke on import — silently,
+    # since CI only ran on PRs and main had not been exercised since
+    # 2026-07-27 while `Publish to PyPI` kept shipping (morning-signal-I132).
+    # Raise this deliberately after reading krepis's changelog, never by
+    # deleting the ceiling.
+    "krepis[anthropic,openai]>=0.24.0,<0.25.0",
     "pydantic>=2.0",
     # Pydantic v2 cannot eval PEP 604 `str | None` field annotations under
     # Python 3.9 even with `from __future__ import annotations` (mirrors krepis).
