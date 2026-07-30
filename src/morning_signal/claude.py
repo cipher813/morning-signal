@@ -915,7 +915,7 @@ def generate_script(
         and not os.environ.get(LLM_ENV_VAR)
     )
 
-    primary_client = LLMClient(primary_spec, max_retries=5)
+    primary_client = LLMClient(primary_spec, callsite_id="morning-signal-episode-primary", max_retries=5)
     primary_failed_exc: Exception | None = None
     try:
         script, outcome = _attempt_episode(
@@ -950,7 +950,7 @@ def generate_script(
         fallback_spec = _anthropic_default_spec(config)
         try:
             fallback_spec = resolve_fallback_spec(config)
-            fallback_client = LLMClient(fallback_spec, max_retries=5)
+            fallback_client = LLMClient(fallback_spec, callsite_id="morning-signal-episode-fallback", max_retries=5)
             script, fallback_outcome = _attempt_episode(
                 fallback_client, config, prompt_text, user_content, date_str,
                 edition, required_topics, effective_edition, edition_label,
@@ -982,7 +982,7 @@ def generate_script(
             )
             try:
                 ultimate_spec = _anthropic_default_spec(config)
-                ultimate_client = LLMClient(ultimate_spec, max_retries=5)
+                ultimate_client = LLMClient(ultimate_spec, callsite_id="morning-signal-episode-ultimate", max_retries=5)
                 script, fallback_outcome = _attempt_episode(
                     ultimate_client, config, prompt_text, user_content,
                     date_str, edition, required_topics, effective_edition,
