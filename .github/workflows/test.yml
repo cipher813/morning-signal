@@ -5,6 +5,18 @@ on:
     branches: [main, "feat/**"]
   pull_request:
     branches: [main]
+  # Every trigger above is caused by a CHANGE IN THIS REPO, so none of them can
+  # detect a break caused by something outside it. That is not hypothetical:
+  # krepis added a required `callsite_id` argument, this repo floated it on an
+  # open `>=` range, and the suite broke on a tree nobody had touched. `main`
+  # last ran CI on 2026-07-27 simply because nothing was pushed — while
+  # `publish.yml` kept shipping to PyPI from that same tree (morning-signal-I132).
+  #
+  # A daily run is the smallest cadence that turns "broken and invisible" into
+  # "broken and dated", matching pip-audit.yml's reasoning in this repo.
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch:
 
 jobs:
   test:

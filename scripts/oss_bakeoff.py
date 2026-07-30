@@ -131,7 +131,7 @@ def _run_side(
     """Issue one grounded call on ``spec`` and score it against the SAME
     coverage guards the production path enforces (see ``claude.py``).
     """
-    client = LLMClient(spec, max_retries=3)
+    client = LLMClient(spec, callsite_id="morning-signal-oss-bakeoff", max_retries=3)
     result = client.complete_grounded(
         system=prompt_text,
         user_content=user_content,
