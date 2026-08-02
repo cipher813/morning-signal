@@ -62,7 +62,7 @@ class _FakeLLMClient:
             raise step
         return step
 
-    def complete(self, *, system, user_content, max_tokens, cache_system):
+    def complete(self, *, system, user_content, max_tokens, cache_system, on_unsupported="raise"):
         self.complete_calls += 1
         if not self._complete_plan:
             raise AssertionError("complete called more times than scripted")
