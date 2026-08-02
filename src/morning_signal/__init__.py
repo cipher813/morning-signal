@@ -5,6 +5,6 @@ with a TTS engine (Amazon Polly or Google Chirp3 HD), publishes the MP3 + RSS
 feed to S3, and optionally sends a success/failure notification via Telegram.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = ["__version__"]

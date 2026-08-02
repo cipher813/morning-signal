@@ -41,19 +41,32 @@ def patched(monkeypatch):
 
 class _FakeLLMClient:
     """Duck-typed stand-in for ``krepis.llm.LLMClient`` — a ``spec`` plus a
-    scripted ``complete_grounded`` that returns/raises from a fixed plan.
+    scripted ``complete_grounded`` / ``complete`` that returns/raises from a
+    fixed plan. ``complete`` is used by the litellm (and other non-web-search)
+    path when ``complete_grounded`` raises ``LLMConfigError``.
     """
 
-    def __init__(self, spec: ModelSpec, plan: list):
+    def __init__(self, spec: ModelSpec, plan: list, complete_plan: list | None = None):
         self.spec = spec
         self._plan = list(plan)
+        self._complete_plan = list(complete_plan or [])
         self.force_first_calls: list[bool] = []
+        self.complete_calls: int = 0
 
     def complete_grounded(self, *, system, user_content, search, max_tokens, cache_system):
         self.force_first_calls.append(search.force_first)
         if not self._plan:
             raise AssertionError("complete_grounded called more times than scripted")
         step = self._plan.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+    def complete(self, *, system, user_content, max_tokens, cache_system):
+        self.complete_calls += 1
+        if not self._complete_plan:
+            raise AssertionError("complete called more times than scripted")
+        step = self._complete_plan.pop(0)
         if isinstance(step, Exception):
             raise step
         return step
@@ -135,3 +148,69 @@ def test_n_searches_falls_back_to_usage_when_searches_empty(patched):
     )
 
     assert n_searches == 5
+
+
+def test_litellm_falls_through_to_complete_when_grounded_unsupported(patched):
+    """litellm (and any non-anthropic/openrouter provider) has no server-side
+    web_search — complete_grounded raises LLMConfigError and the path falls
+    through to complete(), wrapping the plain text result as a GroundedResult
+    with empty searches/citations. Grounding then comes from the pre-fetched
+    news_context digest injected by build_episode_request.
+    """
+    from types import SimpleNamespace
+
+    complete_result = SimpleNamespace(
+        text="Welcome to Morning Signal. News-context grounded.",
+        model="deepseek-v4-pro",
+        provider="litellm",
+        usage=LLMUsage(),
+        raw_request={},
+        raw_response=None,
+    )
+    client = _FakeLLMClient(
+        ModelSpec("litellm", "high"),
+        plan=[LLMConfigError("complete_grounded unsupported on litellm")],
+        complete_plan=[complete_result],
+    )
+
+    result, n_searches = claude._invoke_and_record(
+        client, {}, "sys", "user", "2026-08-02", "am", force_search=False,
+    )
+
+    assert result.text == "Welcome to Morning Signal. News-context grounded."
+    assert result.provider == "litellm"
+    assert result.model == "deepseek-v4-pro"
+    assert result.searches == []
+    assert result.citations == []
+    assert n_searches == 0
+    assert client.complete_calls == 1
+    assert client.force_first_calls == [False]
+
+
+def test_litellm_force_search_is_noop_via_complete(patched):
+    """force_search=True on a non-web-search transport must not raise —
+    force is a no-op and complete() still produces the script.
+    """
+    from types import SimpleNamespace
+
+    complete_result = SimpleNamespace(
+        text="ok",
+        model="deepseek-v4-pro",
+        provider="litellm",
+        usage=LLMUsage(),
+        raw_request={},
+        raw_response=None,
+    )
+    client = _FakeLLMClient(
+        ModelSpec("litellm", "high"),
+        plan=[LLMConfigError("complete_grounded unsupported on litellm")],
+        complete_plan=[complete_result],
+    )
+
+    result, n_searches = claude._invoke_and_record(
+        client, {}, "sys", "user", "2026-08-02", "am", force_search=True,
+    )
+
+    assert result.text == "ok"
+    assert n_searches == 0
+    assert client.complete_calls == 1
