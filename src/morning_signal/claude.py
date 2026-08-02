@@ -26,7 +26,7 @@ import re
 import sys
 from datetime import datetime, timezone
 
-from krepis.llm import LLMClient, SearchOptions
+from krepis.llm import GroundedResult, LLMClient, SearchOptions
 from krepis.llm_capture import capture_llm_call
 from krepis.llm_config import LLMConfigError, ModelSpec, parse_model_spec
 from krepis.trading_calendar import is_trading_day
@@ -48,6 +48,12 @@ from morning_signal.search_telemetry import (
 )
 
 log = logging.getLogger("morning-signal")
+
+# Transports that support server-side web search — anthropic (native
+# web_search tool) and openrouter (openrouter:web_search server tool).
+# Every other provider (litellm, openai, direct) lacks server-side search;
+# grounding there comes from the pre-fetched news_context digest.
+_PROVIDERS_WITH_WEB_SEARCH: frozenset[str] = frozenset({"anthropic", "openrouter"})
 
 
 def verify_script_grounded(
@@ -327,7 +333,7 @@ def _invoke_and_record(
     (same disk the episode itself writes to).
     """
 
-    def _call(*, force: bool):
+    def _call_grounded(*, force: bool) -> GroundedResult:
         return llm_client.complete_grounded(
             system=prompt_text,
             user_content=user_content,
@@ -339,19 +345,55 @@ def _invoke_and_record(
             cache_system=True,
         )
 
-    try:
-        result = _call(force=force_search)
-    except LLMConfigError:
-        if not force_search:
-            raise
-        log.warning(
-            f"provider={llm_client.spec.provider!r} cannot force web_search "
-            f"via tool_choice (SearchOptions.force_first unsupported on this "
-            f"transport) — retrying the recovery pass with prose-only "
-            f"forcing. Coverage on this pass is best-effort, NOT hard-"
-            f"guaranteed the way it is on the anthropic transport."
+    def _call_complete() -> GroundedResult:
+        complete_result = llm_client.complete(
+            system=prompt_text,
+            user_content=user_content,
+            max_tokens=config.get("max_tokens", 4096),
+            cache_system=True,
         )
-        result = _call(force=False)
+        return GroundedResult(
+            text=complete_result.text,
+            model=complete_result.model,
+            provider=complete_result.provider,
+            usage=complete_result.usage,
+            raw_request=complete_result.raw_request,
+            raw_response=complete_result.raw_response,
+            searches=[],
+            citations=[],
+        )
+
+    try:
+        result = _call_grounded(force=force_search)
+    except LLMConfigError:
+        if force_search:
+            if llm_client.spec.provider not in _PROVIDERS_WITH_WEB_SEARCH:
+                log.info(
+                    f"provider={llm_client.spec.provider!r} does not support "
+                    f"server-side web search — using news-context-grounded "
+                    f"complete() instead. force_search is a no-op on this "
+                    f"transport."
+                )
+                result = _call_complete()
+            else:
+                log.warning(
+                    f"provider={llm_client.spec.provider!r} cannot force "
+                    f"web_search via tool_choice (SearchOptions.force_first "
+                    f"unsupported on this transport) — retrying the recovery "
+                    f"pass with prose-only forcing. Coverage on this pass is "
+                    f"best-effort, NOT hard-guaranteed the way it is on the "
+                    f"anthropic transport."
+                )
+                result = _call_grounded(force=False)
+        elif llm_client.spec.provider not in _PROVIDERS_WITH_WEB_SEARCH:
+            log.info(
+                f"provider={llm_client.spec.provider!r} does not support "
+                f"server-side web search — using news-context-grounded "
+                f"complete() instead."
+            )
+            result = _call_complete()
+        else:
+            raise
 
     cost = record_result_cost(
         result=result,
@@ -591,168 +633,179 @@ def _attempt_episode(
         force_search=force_search,
     )
 
-    # Content-grounding verification: replaces the old raw search-count
-    # floor (``min_web_searches``) which was a proxy metric — counting
-    # tool invocations rather than measuring whether the model actually
-    # used search content. Different providers search with very different
-    # cadences, so a count floor penalizes providers that do fewer,
-    # more targeted searches. The real signal is: did the search tool
-    # return substantive web content? ``verify_script_grounded`` checks
-    # that citations exist with real metadata, and also WARNs on
-    # date-awareness gaps and anti-hallucination tells.
-    # Raise BEFORE any TTS/publish so the silent-failure watchdog catches
-    # the absent fresh episode instead of a bad one going live.
-    min_citations = config.get("min_grounding_citations", 1)
-    # Backward compat: if old ``min_web_searches`` is set, map it onto
-    # the new key (0 = disable, just like before).
-    if "min_web_searches" in config and "min_grounding_citations" not in config:
-        min_citations = config["min_web_searches"]
-        log.warning(
-            "DEPRECATED: min_web_searches is retired in favour of "
-            "min_grounding_citations (same semantics: ≥0; 0 = disable). "
-            "Update your config."
-        )
-    if min_citations > 0:
-        verify_script_grounded(
-            script=result.text,
-            citations=result.citations,
-            date_str=date_str,
-            edition_label=edition_label,
-            friendly_date=friendly_date,
-            provider=llm_client.spec.provider,
-            min_citations=min_citations,
-        )
+    # When the transport lacks server-side web search (litellm, openai,
+    # direct), the pre-fetched news_context digest injected by
+    # build_episode_request is the sole grounding source. Searches and
+    # citations are both empty by construction — skip the web-search-
+    # dependent guards (grounding verification, required_search_topics,
+    # recovery pass) rather than falsely failing them.
+    _news_context_grounded = (
+        llm_client.spec.provider not in _PROVIDERS_WITH_WEB_SEARCH
+    )
 
-    # Per-segment coverage guard: the global content-grounding check only
-    # asserts the edition was grounded *somewhere*; it does NOT guarantee a
-    # *specific* search-critical segment was covered. The failure mode this
-    # catches (2026-06-17): with a tight ``web_search_max_uses`` budget the
-    # model spends its searches on the earlier, digest-reinforced segments and
-    # reaches the no-digest segments (e.g. a political pulse sourced only from
-    # Truth Social / X) with no budget left — then writes them from memory.
-    # ``required_search_topics`` lets the operator assert, per topic, that at
-    # least ``min_matches`` searches actually targeted it. Default empty =
-    # no-op (OSS-safe); the topics are declared in the operator's config
-    # alongside the prompt that defines those segments. A topic can be scoped
-    # to specific editions (``editions: [...]``) so a weekday-only segment does
-    # not falsely abort the "weekend" edition, which runs a different prompt
-    # with different segments and legitimately never searches it.
-    #
-    # Coverage handling has three tiers, in order of preference:
-    #   1. SELF-HEAL (default) — if a required segment is uncovered, fire ONE
-    #      bounded recovery regeneration whose user message names the dropped
-    #      segment(s) and mandates a dedicated search + written segment for
-    #      each. Adopt the recovered draft only if it covers strictly more.
-    #      This actually FIXES the recurring political-segment drop (4th
-    #      occurrence 2026-06-29) instead of only alerting on it.
-    #   2. PUBLISH + ALERT (degraded-coverage policy, 2026-06-26, Brian) — if
-    #      recovery is disabled or still can't cover the segment, an uncovered
-    #      segment is a QUALITY defect, not grounds to withhold the whole
-    #      episode: every OTHER segment is grounded, so a pod with one stale
-    #      segment beats no pod. WARN log + flow-doctor/Telegram alert naming
-    #      the uncovered topics, then publish. NOT a silent swallow (fail-loud
-    #      policy): (a) the swallowed mode is a segment likely written from
-    #      memory; (b) the episode still ships; (c) the surfaces are a WARN log
-    #      + a Telegram alert.
-    #   3. HARD ABORT — operators who would rather skip than ship a stale
-    #      segment (the 2026-06-16 digest-hallucination posture) set
-    #      ``required_search_topics_fatal: true``; recovery still runs first,
-    #      so we abort only when even the forced retry could not cover it.
-    # Coverage is judged with the SCRIPT in hand (not just search telemetry):
-    # a topic counts as covered only when it was both searched AND its segment
-    # actually aired — closing the blind spot where another segment's search
-    # (e.g. "Elon Musk / SpaceX") falsely satisfied a political topic. The
-    # global content-grounding check above stays in effect regardless — a
-    # no-search-results edition is hallucinated wholesale, a different and
-    # unrecoverable failure.
     unmet: list[str] = []
-    if required_topics:
-        fatal = config.get("required_search_topics_fatal", False)
-        recover = config.get("required_search_topics_recover", True)
-        # GroundedResult.text is the post-final-tool text; .searches carries
-        # the per-query events (anthropic-only) and .citations carries the
-        # cross-provider fallback (both extracted by krepis.llm_search) — no
-        # response re-parsing needed.
-        unmet = unmet_required_topics(
-            result.searches, required_topics,
-            edition=effective_edition, script=result.text,
-            citations=result.citations,
-        )
-
-        if unmet and recover:
+    if not _news_context_grounded:
+        # Content-grounding verification: replaces the old raw search-count
+        # floor (``min_web_searches``) which was a proxy metric — counting
+        # tool invocations rather than measuring whether the model actually
+        # used search content. Different providers search with very different
+        # cadences, so a count floor penalizes providers that do fewer,
+        # more targeted searches. The real signal is: did the search tool
+        # return substantive web content? ``verify_script_grounded`` checks
+        # that citations exist with real metadata, and also WARNs on
+        # date-awareness gaps and anti-hallucination tells.
+        # Raise BEFORE any TTS/publish so the silent-failure watchdog catches
+        # the absent fresh episode instead of a bad one going live.
+        min_citations = config.get("min_grounding_citations", 1)
+        # Backward compat: if old ``min_web_searches`` is set, map it onto
+        # the new key (0 = disable, just like before).
+        if "min_web_searches" in config and "min_grounding_citations" not in config:
+            min_citations = config["min_web_searches"]
             log.warning(
-                f"DEGRADED COVERAGE on first pass for {edition_label} edition "
-                f"({friendly_date}): {', '.join(unmet)}. Firing one targeted "
-                f"recovery regeneration that forces these segment(s)."
+                "DEPRECATED: min_web_searches is retired in favour of "
+                "min_grounding_citations (same semantics: ≥0; 0 = disable). "
+                "Update your config."
             )
-            directive = _coverage_recovery_directive(
-                unmet, required_topics, effective_edition
+        if min_citations > 0:
+            verify_script_grounded(
+                script=result.text,
+                citations=result.citations,
+                date_str=date_str,
+                edition_label=edition_label,
+                friendly_date=friendly_date,
+                provider=llm_client.spec.provider,
+                min_citations=min_citations,
             )
-            # Deterministically FORCE a web_search on the recovery pass rather
-            # than only asking for one in prose — the prose ask is the same
-            # stochastic compliance that already failed on the first pass.
-            # (SearchOptions.force_first → forced server-tool tool_choice;
-            # API-supported, verified live 2026-06-29. On a transport that
-            # can't force it, _invoke_and_record degrades to prose-only
-            # forcing and logs it — see its docstring.)
-            try:
-                r2, n2 = _invoke_and_record(
-                    llm_client, config, prompt_text, user_content + directive,
-                    date_str, edition, force_search=True,
-                )
-                unmet2 = unmet_required_topics(
-                    r2.searches, required_topics,
-                    edition=effective_edition, script=r2.text,
-                    citations=r2.citations,
-                )
-                if len(unmet2) < len(unmet):
-                    log.info(
-                        f"Recovery improved coverage for {edition_label} "
-                        f"edition ({friendly_date}): {len(unmet)}→"
-                        f"{len(unmet2)} uncovered "
-                        f"(now: {', '.join(unmet2) or 'all covered'})."
-                    )
-                    result, n_searches, unmet = r2, n2, unmet2
-                else:
-                    log.warning(
-                        f"Recovery did not improve coverage for "
-                        f"{edition_label} edition ({friendly_date}): still "
-                        f"{len(unmet2)} uncovered ({', '.join(unmet2)}). "
-                        f"Keeping the original draft."
-                    )
-            except Exception:  # noqa: BLE001 — recovery must never block publish
+
+        # Per-segment coverage guard: the global content-grounding check only
+        # asserts the edition was grounded *somewhere*; it does NOT guarantee a
+        # *specific* search-critical segment was covered. The failure mode this
+        # catches (2026-06-17): with a tight ``web_search_max_uses`` budget the
+        # model spends its searches on the earlier, digest-reinforced segments and
+        # reaches the no-digest segments (e.g. a political pulse sourced only from
+        # Truth Social / X) with no budget left — then writes them from memory.
+        # ``required_search_topics`` lets the operator assert, per topic, that at
+        # least ``min_matches`` searches actually targeted it. Default empty =
+        # no-op (OSS-safe); the topics are declared in the operator's config
+        # alongside the prompt that defines those segments. A topic can be scoped
+        # to specific editions (``editions: [...]``) so a weekday-only segment does
+        # not falsely abort the "weekend" edition, which runs a different prompt
+        # with different segments and legitimately never searches it.
+        #
+        # Coverage handling has three tiers, in order of preference:
+        #   1. SELF-HEAL (default) — if a required segment is uncovered, fire ONE
+        #      bounded recovery regeneration whose user message names the dropped
+        #      segment(s) and mandates a dedicated search + written segment for
+        #      each. Adopt the recovered draft only if it covers strictly more.
+        #      This actually FIXES the recurring political-segment drop (4th
+        #      occurrence 2026-06-29) instead of only alerting on it.
+        #   2. PUBLISH + ALERT (degraded-coverage policy, 2026-06-26, Brian) — if
+        #      recovery is disabled or still can't cover the segment, an uncovered
+        #      segment is a QUALITY defect, not grounds to withhold the whole
+        #      episode: every OTHER segment is grounded, so a pod with one stale
+        #      segment beats no pod. WARN log + flow-doctor/Telegram alert naming
+        #      the uncovered topics, then publish. NOT a silent swallow (fail-loud
+        #      policy): (a) the swallowed mode is a segment likely written from
+        #      memory; (b) the episode still ships; (c) the surfaces are a WARN log
+        #      + a Telegram alert.
+        #   3. HARD ABORT — operators who would rather skip than ship a stale
+        #      segment (the 2026-06-16 digest-hallucination posture) set
+        #      ``required_search_topics_fatal: true``; recovery still runs first,
+        #      so we abort only when even the forced retry could not cover it.
+        # Coverage is judged with the SCRIPT in hand (not just search telemetry):
+        # a topic counts as covered only when it was both searched AND its segment
+        # actually aired — closing the blind spot where another segment's search
+        # (e.g. "Elon Musk / SpaceX") falsely satisfied a political topic. The
+        # global content-grounding check above stays in effect regardless — a
+        # no-search-results edition is hallucinated wholesale, a different and
+        # unrecoverable failure.
+        if required_topics:
+            fatal = config.get("required_search_topics_fatal", False)
+            recover = config.get("required_search_topics_recover", True)
+            # GroundedResult.text is the post-final-tool text; .searches carries
+            # the per-query events (anthropic-only) and .citations carries the
+            # cross-provider fallback (both extracted by krepis.llm_search) — no
+            # response re-parsing needed.
+            unmet = unmet_required_topics(
+                result.searches, required_topics,
+                edition=effective_edition, script=result.text,
+                citations=result.citations,
+            )
+
+            if unmet and recover:
                 log.warning(
-                    "Recovery regeneration failed; keeping the original "
-                    "degraded draft and falling through to alert.",
-                    exc_info=True,
+                    f"DEGRADED COVERAGE on first pass for {edition_label} edition "
+                    f"({friendly_date}): {', '.join(unmet)}. Firing one targeted "
+                    f"recovery regeneration that forces these segment(s)."
                 )
+                directive = _coverage_recovery_directive(
+                    unmet, required_topics, effective_edition
+                )
+                # Deterministically FORCE a web_search on the recovery pass rather
+                # than only asking for one in prose — the prose ask is the same
+                # stochastic compliance that already failed on the first pass.
+                # (SearchOptions.force_first → forced server-tool tool_choice;
+                # API-supported, verified live 2026-06-29. On a transport that
+                # can't force it, _invoke_and_record degrades to prose-only
+                # forcing and logs it — see its docstring.)
+                try:
+                    r2, n2 = _invoke_and_record(
+                        llm_client, config, prompt_text, user_content + directive,
+                        date_str, edition, force_search=True,
+                    )
+                    unmet2 = unmet_required_topics(
+                        r2.searches, required_topics,
+                        edition=effective_edition, script=r2.text,
+                        citations=r2.citations,
+                    )
+                    if len(unmet2) < len(unmet):
+                        log.info(
+                            f"Recovery improved coverage for {edition_label} "
+                            f"edition ({friendly_date}): {len(unmet)}→"
+                            f"{len(unmet2)} uncovered "
+                            f"(now: {', '.join(unmet2) or 'all covered'})."
+                        )
+                        result, n_searches, unmet = r2, n2, unmet2
+                    else:
+                        log.warning(
+                            f"Recovery did not improve coverage for "
+                            f"{edition_label} edition ({friendly_date}): still "
+                            f"{len(unmet2)} uncovered ({', '.join(unmet2)}). "
+                            f"Keeping the original draft."
+                        )
+                except Exception:  # noqa: BLE001 — recovery must never block publish
+                    log.warning(
+                        "Recovery regeneration failed; keeping the original "
+                        "degraded draft and falling through to alert.",
+                        exc_info=True,
+                    )
 
-        if unmet:
-            if fatal:
-                log.error(
-                    f"ABORT: {edition_label} edition for {friendly_date} did "
-                    f"not cover required topic(s): {', '.join(unmet)} (even "
-                    f"after recovery). The global search floor was met but a "
-                    f"search-critical segment was skipped — almost certainly "
-                    f"written from memory. required_search_topics_fatal=true → "
-                    f"refusing to publish."
+            if unmet:
+                if fatal:
+                    log.error(
+                        f"ABORT: {edition_label} edition for {friendly_date} did "
+                        f"not cover required topic(s): {', '.join(unmet)} (even "
+                        f"after recovery). The global search floor was met but a "
+                        f"search-critical segment was skipped — almost certainly "
+                        f"written from memory. required_search_topics_fatal=true → "
+                        f"refusing to publish."
+                    )
+                    raise RuntimeError(
+                        f"required search topic(s) not covered: {', '.join(unmet)} "
+                        f"for {date_str}-{edition} — aborting before publish"
+                    )
+                budget = config.get("web_search_max_uses", 20)
+                log.warning(
+                    f"DEGRADED COVERAGE: {edition_label} edition for "
+                    f"{friendly_date} shipped without covering required topic(s): "
+                    f"{', '.join(unmet)} (budget web_search_max_uses={budget}). "
+                    f"Publishing anyway + alerting for async triage. Set "
+                    f"required_search_topics_fatal=true to hard-abort instead."
                 )
-                raise RuntimeError(
-                    f"required search topic(s) not covered: {', '.join(unmet)} "
-                    f"for {date_str}-{edition} — aborting before publish"
+                _alert_degraded_coverage(
+                    config, effective_edition, edition_label, date_str,
+                    unmet, n_searches, budget,
                 )
-            budget = config.get("web_search_max_uses", 20)
-            log.warning(
-                f"DEGRADED COVERAGE: {edition_label} edition for "
-                f"{friendly_date} shipped without covering required topic(s): "
-                f"{', '.join(unmet)} (budget web_search_max_uses={budget}). "
-                f"Publishing anyway + alerting for async triage. Set "
-                f"required_search_topics_fatal=true to hard-abort instead."
-            )
-            _alert_degraded_coverage(
-                config, effective_edition, edition_label, date_str,
-                unmet, n_searches, budget,
-            )
 
     outcome = {
         "provider": result.provider,
@@ -923,7 +976,7 @@ def generate_script(
             edition, required_topics, effective_edition, edition_label,
             friendly_date,
         )
-    except RuntimeError as exc:
+    except Exception as exc:
         script, outcome = "", None
         primary_failed_exc = exc
 
@@ -958,7 +1011,7 @@ def generate_script(
             )
             used_spec = fallback_spec
             fell_back = True
-        except RuntimeError as exc:
+        except Exception as exc:
             fallback_outcome = None
             primary_failed_exc = exc
 
@@ -991,7 +1044,7 @@ def generate_script(
                 used_spec = ultimate_spec
                 fell_back = True
                 primary_failed_exc = None
-            except RuntimeError as exc:
+            except Exception as exc:
                 log.error(
                     f"{edition_label} edition for {friendly_date}: forced-"
                     f"search Anthropic last-resort also failed ({exc}) — "

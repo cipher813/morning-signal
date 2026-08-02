@@ -75,10 +75,22 @@ schedule:
 # Active model spec via the krepis provider-agnostic adapter. Format:
 # "provider:model" (or a krepis ModelSpec JSON object as a string).
 # When omitted, falls back to the legacy anthropic + claude_model pair below —
-# behavior-identical for pre-migration configs. Generation is grounded on the
-# provider's server-side web search: supported on anthropic and openrouter
-# (Phase B; the coverage guard's forced-search recovery is anthropic-only
-# until the citation-keyed guard ships). Env override: MORNING_SIGNAL_LLM.
+# behavior-identical for pre-migration configs.
+#
+# Grounding depends on the transport:
+#   - anthropic / openrouter — server-side web_search (native tool or
+#     openrouter:web_search). Coverage guards + forced-search recovery apply
+#     (force is anthropic-only; openrouter degrades to prose forcing).
+#   - litellm (krepis router model groups: low/med/high/ultra) — no server-
+#     side search. Grounding comes from the pre-fetched news_context digest
+#     (enable news_context: below). The citation / required_search_topics
+#     guards are skipped on this path rather than falsely failing.
+#
+# Production (dashboard box) uses the krepis ``high`` group via the local
+# LiteLLM proxy — litellm falls through the group's own chain
+# (deepseek-v4-pro-max → grok-4 → qwen3-max → openrouter deepseek-v4-pro).
+# Env override: MORNING_SIGNAL_LLM.
+# llm: '{"provider": "litellm", "model": "high"}'
 # llm: "anthropic:claude-sonnet-4-6"
 claude_model: "claude-sonnet-4-6"  # legacy knob — feeds the default spec
 max_tokens: 8192

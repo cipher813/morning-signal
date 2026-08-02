@@ -37,7 +37,18 @@ def _grounded(*, provider, model, text, n_searches, citations=None):
 def _client_factory(plan):
     """``plan`` maps provider -> list of GroundedResult to pop per call
     (so a provider hit twice, e.g. primary first-pass + recovery, can
-    return different results in sequence)."""
+    return different results in sequence).
+
+    Providers without server-side web search (``litellm``) never get a
+    successful ``complete_grounded`` — they raise ``LLMConfigError`` and
+    the production path falls through to ``complete()``. Script those
+    providers' results the same way; ``complete`` returns a SimpleNamespace
+    shaped like ``LLMResult`` so the wrap-to-GroundedResult path works.
+    """
+    from types import SimpleNamespace
+
+    from krepis.llm_config import LLMConfigError
+
     remaining = {k: list(v) for k, v in plan.items()}
 
     class _FakeClient:
@@ -45,12 +56,37 @@ def _client_factory(plan):
             self.spec = spec
 
         def complete_grounded(self, **kw):
+            if self.spec.provider not in ("anthropic", "openrouter"):
+                raise LLMConfigError(
+                    f"complete_grounded unsupported on {self.spec.provider}"
+                )
             queue = remaining.get(self.spec.provider)
             if not queue:
                 raise AssertionError(
                     f"no more scripted responses for provider={self.spec.provider!r}"
                 )
             return queue.pop(0)
+
+        def complete(self, **kw):
+            queue = remaining.get(self.spec.provider)
+            if not queue:
+                raise AssertionError(
+                    f"no more scripted complete() responses for "
+                    f"provider={self.spec.provider!r}"
+                )
+            gr = queue.pop(0)
+            # Accept either a GroundedResult (tests script the final shape)
+            # or a SimpleNamespace already shaped like LLMResult.
+            if isinstance(gr, SimpleNamespace):
+                return gr
+            return SimpleNamespace(
+                text=gr.text,
+                model=gr.model,
+                provider=gr.provider,
+                usage=gr.usage,
+                raw_request=gr.raw_request,
+                raw_response=gr.raw_response,
+            )
 
     return _FakeClient
 
@@ -60,6 +96,10 @@ def _client_factory_with_capture(plan):
     force_first)`` for every ``complete_grounded`` call, so a test can
     assert a specific tier's call actually forced ``tool_choice`` rather
     than just asking for a search in prose."""
+    from types import SimpleNamespace
+
+    from krepis.llm_config import LLMConfigError
+
     remaining = {k: list(v) for k, v in plan.items()}
     calls = []
 
@@ -69,12 +109,36 @@ def _client_factory_with_capture(plan):
 
         def complete_grounded(self, *, search, **kw):
             calls.append((self.spec.provider, search.force_first))
+            if self.spec.provider not in ("anthropic", "openrouter"):
+                raise LLMConfigError(
+                    f"complete_grounded unsupported on {self.spec.provider}"
+                )
             queue = remaining.get(self.spec.provider)
             if not queue:
                 raise AssertionError(
                     f"no more scripted responses for provider={self.spec.provider!r}"
                 )
             return queue.pop(0)
+
+        def complete(self, **kw):
+            calls.append((self.spec.provider, None))
+            queue = remaining.get(self.spec.provider)
+            if not queue:
+                raise AssertionError(
+                    f"no more scripted complete() responses for "
+                    f"provider={self.spec.provider!r}"
+                )
+            gr = queue.pop(0)
+            if isinstance(gr, SimpleNamespace):
+                return gr
+            return SimpleNamespace(
+                text=gr.text,
+                model=gr.model,
+                provider=gr.provider,
+                usage=gr.usage,
+                raw_request=gr.raw_request,
+                raw_response=gr.raw_response,
+            )
 
     return _FakeClient, calls
 
@@ -432,3 +496,81 @@ def test_decision_log_sync_failure_does_not_block_publish(monkeypatch, tmp_path)
 
     assert "All good" in script
     assert _decision_path(tmp_path).exists()
+
+
+# ── litellm / krepis router model-group primary ─────────────────────────────
+#
+# Production now points llm at the krepis router ``high`` group
+# (provider=litellm, model=high). That transport has no server-side web
+# search; grounding comes from the pre-fetched news_context digest. These
+# tests lock the cascade behaviour for that path.
+
+
+def test_litellm_primary_succeeds_via_complete(monkeypatch, tmp_path):
+    """A litellm primary (krepis model group) produces a script through
+    complete() — no web-search grounding check fires, no cascade needed.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    plan = {
+        "litellm": [
+            _grounded(provider="litellm", model="deepseek-v4-pro",
+                      text="Welcome to Morning Signal. High-group content.",
+                      n_searches=0, citations=[]),
+        ],
+    }
+    monkeypatch.setattr(claude, "LLMClient", _client_factory(plan))
+
+    script = claude.generate_script(
+        _base_config(
+            llm='{"provider": "litellm", "model": "high"}',
+            # news-context-grounded path: disable the citation floor so an
+            # empty-citations result is accepted (production does this by
+            # skipping the guard entirely for non-web-search providers).
+            min_grounding_citations=0,
+        ),
+        "2026-08-02", "am",
+    )
+
+    assert "High-group content" in script
+    decision = json.loads(_decision_path(tmp_path, "2026-08-02").read_text())
+    assert decision["primary_provider"] == "litellm"
+    assert decision["used_provider"] == "litellm"
+    assert decision["fell_back"] is False
+
+
+def test_non_runtime_error_from_primary_engages_fallback(monkeypatch, tmp_path):
+    """2026-08-02 incident: OpenRouter HTTP 402 (APIStatusError, NOT a
+    RuntimeError) killed the cascade before the Anthropic ultimate tier
+    could engage. Cascade must catch Exception, not just RuntimeError.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    class _APIStatusError(Exception):
+        """Stand-in for openai.APIStatusError — not a RuntimeError subclass."""
+
+    class _FailThenAnthropic:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+
+        def complete_grounded(self, **kw):
+            if self.spec.provider == "openrouter":
+                raise _APIStatusError(
+                    "Error code: 402 - insufficient credits"
+                )
+            return _grounded(
+                provider="anthropic", model="claude-haiku-4-5",
+                text="Welcome to Morning Signal. Rescued by cascade.",
+                n_searches=4,
+            )
+
+        def complete(self, **kw):
+            raise AssertionError("complete() should not be reached for openrouter/anthropic")
+
+    monkeypatch.setattr(claude, "LLMClient", _FailThenAnthropic)
+
+    script = claude.generate_script(_base_config(), "2026-08-02", "am")
+
+    assert "Rescued by cascade" in script
+    decision = json.loads(_decision_path(tmp_path, "2026-08-02").read_text())
+    assert decision["fell_back"] is True
+    assert decision["used_provider"] == "anthropic"

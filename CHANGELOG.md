@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-08-02
+
+### Changed
+
+- **Primary LLM can be a krepis router model group (`litellm:high` etc.).**
+  Transports without server-side web search (litellm, plain openai) fall
+  through from `complete_grounded` to `complete()`, grounding on the
+  pre-fetched `news_context` digest instead of live search. Citation and
+  `required_search_topics` guards are skipped on that path rather than
+  falsely aborting an empty-search result. Production points
+  `/morning-signal/config-yaml` at `{"provider": "litellm", "model": "high"}`
+  so the local LiteLLM proxy owns primary routing + its own fallback chain.
+- **Cascade catches all exceptions, not just `RuntimeError`.** A primary
+  billing failure (OpenRouter HTTP 402 on 2026-08-02) is an
+  `APIStatusError`, not a `RuntimeError` — the previous `except RuntimeError`
+  let it kill the process before the Anthropic ultimate tier engaged.
+  Cascade now catches `Exception` at every tier so non-RuntimeError provider
+  failures still fall through.
+
 ### Added
 
 - **`schedule:` config block — per-date scheduled content overrides
