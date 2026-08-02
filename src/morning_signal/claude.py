@@ -351,6 +351,7 @@ def _invoke_and_record(
             user_content=user_content,
             max_tokens=config.get("max_tokens", 4096),
             cache_system=True,
+            on_unsupported="drop",
         )
         return GroundedResult(
             text=complete_result.text,
