@@ -123,6 +123,68 @@ def _all_pass_plan(*, prod_unmet=False):
     }
 
 
+def test_prod_side_survives_a_spec_with_no_server_side_web_search(
+    bakeoff_module, monkeypatch
+):
+    """Regression, live failure 2026-08-05 through 2026-08-08.
+
+    When the production ``llm`` config moved to a krepis router group
+    (provider ``litellm``, #135), this script's prod side still issued a bare
+    ``complete_grounded`` — which that transport does not support — so the
+    weekly unit exited 1 on every run while the production episode, which
+    degrades to ``complete()``, aired normally. The bakeoff must exercise
+    whatever spec production actually uses, or it measures nothing.
+    """
+    from krepis.llm import LLMResult
+    from krepis.llm_config import LLMConfigError
+
+    monkeypatch.setenv("MORNING_SIGNAL_LLM", '{"provider": "litellm", "model": "high"}')
+
+    plan = _all_pass_plan()
+
+    class _Client:
+        def __init__(self, spec: ModelSpec, **kw):
+            self.spec = spec
+
+        def complete_grounded(self, **kw):
+            if self.spec.provider == "litellm":
+                raise LLMConfigError(
+                    "complete_grounded is only supported on the anthropic "
+                    "provider or openrouter; provider 'litellm' has neither."
+                )
+            return plan[self.spec.model]
+
+        def complete(self, **kw):
+            assert kw["on_unsupported"] == "drop", (
+                "the prod side must degrade the same way production does"
+            )
+            grounded = _grounded(
+                provider="litellm", model="high",
+                unmet_hit=False, web_search_requests=0,
+            )
+            return LLMResult(
+                text=grounded.text,
+                model=grounded.model,
+                provider=grounded.provider,
+                usage=grounded.usage,
+                raw_request={},
+                raw_response=None,
+            )
+
+    monkeypatch.setattr(bakeoff_module, "LLMClient", _Client)
+
+    from morning_signal.config import load_config
+
+    record = bakeoff_module.run_bakeoff(load_config(), "2026-07-06", "am")
+
+    assert record["prod"]["provider"] == "litellm"
+    assert record["prod"]["model"] == "high"
+    # A no-web-search transport reports zero searches by construction; the
+    # comparison still ran, which is the whole point of the regression.
+    assert record["prod"]["n_searches"] == 0
+    assert set(record["candidates"]) == {"kimi-k2.6", "mimo-v2.5-pro"}
+
+
 def test_run_bakeoff_reports_parity_for_every_candidate(bakeoff_module, monkeypatch):
     from morning_signal.config import load_config
 

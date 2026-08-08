@@ -538,6 +538,88 @@ def test_litellm_primary_succeeds_via_complete(monkeypatch, tmp_path):
     assert decision["fell_back"] is False
 
 
+def test_primary_unusable_in_this_deployment_alerts(monkeypatch, tmp_path):
+    """A primary that was never CALLABLE here alerts, on top of falling back.
+
+    Live 2026-08-08: the litellm primary raised ``ModuleNotFoundError: No
+    module named 'litellm'`` on every run for six days after #135 merged.
+    Each episode logged the abort and then published on the OpenRouter
+    fallback, so the only failure surface — the episode not appearing — never
+    fired. The episode still ships; the point is that somebody is told.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    class _PrimaryNotInstalled:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+
+        def complete_grounded(self, **kw):
+            if self.spec.provider == "litellm":
+                raise ModuleNotFoundError("No module named 'litellm'")
+            return _grounded(
+                provider="anthropic", model="claude-haiku-4-5",
+                text="Welcome to Morning Signal. Aired on the fallback.",
+                n_searches=4,
+            )
+
+        def complete(self, **kw):
+            raise ModuleNotFoundError("No module named 'litellm'")
+
+    monkeypatch.setattr(claude, "LLMClient", _PrimaryNotInstalled)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
+
+    script = claude.generate_script(
+        _base_config(llm='{"provider": "litellm", "model": "high"}'),
+        "2026-08-08", "am",
+    )
+
+    assert "Aired on the fallback" in script
+    assert len(sent) == 1, "a permanently-unusable primary must raise exactly one alert"
+    assert "never callable from this deployment" in sent[0]
+    assert "litellm" in sent[0]
+
+
+def test_ordinary_provider_failure_does_not_alert(monkeypatch, tmp_path):
+    """The counterpart to the test above: a provider that WAS called and
+    failed is what the fallback chain is for. Alerting on it would page for a
+    mechanism working as designed, which is how an alert stops being read.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    class _APIStatusError(Exception):
+        pass
+
+    class _FailThenAnthropic:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+
+        def complete_grounded(self, **kw):
+            if self.spec.provider == "openrouter":
+                raise _APIStatusError("Error code: 402 - insufficient credits")
+            return _grounded(
+                provider="anthropic", model="claude-haiku-4-5",
+                text="Welcome to Morning Signal. Rescued by cascade.",
+                n_searches=4,
+            )
+
+    monkeypatch.setattr(claude, "LLMClient", _FailThenAnthropic)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
+
+    claude.generate_script(_base_config(), "2026-08-08", "am")
+
+    assert sent == []
+
+
 def test_non_runtime_error_from_primary_engages_fallback(monkeypatch, tmp_path):
     """2026-08-02 incident: OpenRouter HTTP 402 (APIStatusError, NOT a
     RuntimeError) killed the cascade before the Anthropic ultimate tier

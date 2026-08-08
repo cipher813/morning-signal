@@ -267,6 +267,74 @@ def _alert_degraded_coverage(
         )
 
 
+def _is_deployment_class_failure(exc: BaseException) -> bool:
+    """True when *exc* means the configured primary spec was never CALLABLE
+    from this deployment, as opposed to having been called and failed.
+
+    The distinction is the whole point of alerting on one and not the other.
+    A provider timeout, a 402, a content filter — those are what the fallback
+    chain exists for, and firing on them would page daily for a mechanism
+    working as designed. A missing transport package (``No module named
+    'litellm'``) is not a provider event at all: the primary cannot succeed
+    on the next run, or any run, until the deployment changes. Absorbing it
+    into the fallback makes a permanent misconfiguration look like a
+    transient one, and nothing else on the episode path distinguishes them.
+
+    Found live 2026-08-08: morning-signal ran every episode on its OpenRouter
+    fallback for six days after the primary was flipped to a krepis router
+    group (#135, merged 2026-08-02) whose transport package was never an
+    installed dependency. Every run logged the abort at ERROR and then
+    published successfully, so no failure surface ever fired — and the
+    fallback in question is direct-OpenRouter linkage, which
+    alpha-engine-config-I6367 forbids. The silence, not the fallback, is
+    what let it stand for six days.
+    """
+    seen: set[int] = set()
+    cursor: BaseException | None = exc
+    while cursor is not None and id(cursor) not in seen:
+        seen.add(id(cursor))
+        if isinstance(cursor, ImportError):  # covers ModuleNotFoundError
+            return True
+        cursor = cursor.__cause__ or cursor.__context__
+    return False
+
+
+def _alert_primary_never_usable(
+    config: dict,
+    edition: str,
+    primary_spec: ModelSpec,
+    exc: BaseException,
+    *,
+    friendly_date: str,
+    edition_label: str,
+) -> None:
+    """Alert that the CONFIGURED primary spec is unusable in this deployment.
+
+    Same best-effort posture as :func:`_alert_degraded_coverage`: the episode
+    ships on the fallback either way, and an alerting bug must never be what
+    takes the podcast off the air. A send failure is logged at WARNING rather
+    than swallowed.
+    """
+    message = (
+        f"🚨 morning-signal {edition_label} edition for {friendly_date}: "
+        f"the CONFIGURED PRIMARY was never callable from this deployment.\n\n"
+        f"Spec: provider={primary_spec.provider!r} model={primary_spec.model!r}\n"
+        f"Error: {exc}\n\n"
+        f"This is a deployment defect, not a provider failure — it will "
+        f"recur on every run until the deployment changes, and every episode "
+        f"until then airs on the FALLBACK spec. The episode still shipped."
+    )
+    try:
+        from morning_signal.watchdog import send_alert
+
+        send_alert(config, edition, message)
+    except Exception:  # noqa: BLE001 — alerting must never block publish
+        log.warning(
+            "PRIMARY-UNUSABLE alert failed to send (continuing to publish)",
+            exc_info=True,
+        )
+
+
 def is_non_trading_day(date_str: str) -> bool:
     """True for Sat/Sun + NYSE holidays. Drives prompt + PM-skip selection."""
     return not is_trading_day(datetime.strptime(date_str, "%Y-%m-%d").date())
@@ -289,6 +357,99 @@ def opening_line(edition: str, weekend: bool) -> str:
     if edition == "pm":
         return "Welcome to Morning Signal, evening edition."
     return "Welcome to Morning Signal."
+
+
+def call_with_grounding_degrade(
+    llm_client: LLMClient,
+    config: dict,
+    prompt_text: str,
+    user_content: str,
+    *,
+    force_search: bool = False,
+) -> GroundedResult:
+    """Issue one generation call, degrading to ``complete()`` on a transport
+    with no server-side web search. Returns the ``GroundedResult``; records
+    nothing.
+
+    This is the single definition of *how morning-signal calls a model*, and
+    it is deliberately separate from :func:`_invoke_and_record`, which is that
+    call PLUS the aired episode's telemetry sinks. The split exists because
+    ``scripts/oss_bakeoff.py`` needs the first and must not have the second:
+    a shadow-canary comparison writing into ``episodes/{date}-{edition}.
+    cost.jsonl`` would mix never-published measurement calls into the aired
+    episode's billed-cost record.
+
+    Before this was factored out, the bakeoff had its own copy of the call
+    that was missing the degrade branch entirely — a bare
+    ``complete_grounded``. That divergence was invisible while the production
+    ``llm`` spec was an Anthropic or OpenRouter one (both have server-side
+    search) and became a hard failure the moment the spec moved to a krepis
+    router group (#135, merged 2026-08-02): production degraded correctly and
+    kept airing, while the weekly bakeoff exited 1 from 2026-08-05 onward on
+    ``LLMConfigError``. Two call sites, one of which had the fix, is the bug
+    — so callers get the behaviour and own their own recording.
+    """
+
+    def _call_grounded(*, force: bool) -> GroundedResult:
+        return llm_client.complete_grounded(
+            system=prompt_text,
+            user_content=user_content,
+            search=SearchOptions(
+                max_uses=config.get("web_search_max_uses", 20),
+                force_first=force,
+            ),
+            max_tokens=config.get("max_tokens", 4096),
+            cache_system=True,
+        )
+
+    def _call_complete() -> GroundedResult:
+        complete_result = llm_client.complete(
+            system=prompt_text,
+            user_content=user_content,
+            max_tokens=config.get("max_tokens", 4096),
+            cache_system=True,
+            on_unsupported="drop",
+        )
+        return GroundedResult(
+            text=complete_result.text,
+            model=complete_result.model,
+            provider=complete_result.provider,
+            usage=complete_result.usage,
+            raw_request=complete_result.raw_request,
+            raw_response=complete_result.raw_response,
+            searches=[],
+            citations=[],
+        )
+
+    try:
+        return _call_grounded(force=force_search)
+    except LLMConfigError:
+        if force_search:
+            if llm_client.spec.provider not in _PROVIDERS_WITH_WEB_SEARCH:
+                log.info(
+                    f"provider={llm_client.spec.provider!r} does not support "
+                    f"server-side web search — using news-context-grounded "
+                    f"complete() instead. force_search is a no-op on this "
+                    f"transport."
+                )
+                return _call_complete()
+            log.warning(
+                f"provider={llm_client.spec.provider!r} cannot force "
+                f"web_search via tool_choice (SearchOptions.force_first "
+                f"unsupported on this transport) — retrying the recovery "
+                f"pass with prose-only forcing. Coverage on this pass is "
+                f"best-effort, NOT hard-guaranteed the way it is on the "
+                f"anthropic transport."
+            )
+            return _call_grounded(force=False)
+        if llm_client.spec.provider not in _PROVIDERS_WITH_WEB_SEARCH:
+            log.info(
+                f"provider={llm_client.spec.provider!r} does not support "
+                f"server-side web search — using news-context-grounded "
+                f"complete() instead."
+            )
+            return _call_complete()
+        raise
 
 
 def _invoke_and_record(
@@ -333,68 +494,10 @@ def _invoke_and_record(
     (same disk the episode itself writes to).
     """
 
-    def _call_grounded(*, force: bool) -> GroundedResult:
-        return llm_client.complete_grounded(
-            system=prompt_text,
-            user_content=user_content,
-            search=SearchOptions(
-                max_uses=config.get("web_search_max_uses", 20),
-                force_first=force,
-            ),
-            max_tokens=config.get("max_tokens", 4096),
-            cache_system=True,
-        )
-
-    def _call_complete() -> GroundedResult:
-        complete_result = llm_client.complete(
-            system=prompt_text,
-            user_content=user_content,
-            max_tokens=config.get("max_tokens", 4096),
-            cache_system=True,
-            on_unsupported="drop",
-        )
-        return GroundedResult(
-            text=complete_result.text,
-            model=complete_result.model,
-            provider=complete_result.provider,
-            usage=complete_result.usage,
-            raw_request=complete_result.raw_request,
-            raw_response=complete_result.raw_response,
-            searches=[],
-            citations=[],
-        )
-
-    try:
-        result = _call_grounded(force=force_search)
-    except LLMConfigError:
-        if force_search:
-            if llm_client.spec.provider not in _PROVIDERS_WITH_WEB_SEARCH:
-                log.info(
-                    f"provider={llm_client.spec.provider!r} does not support "
-                    f"server-side web search — using news-context-grounded "
-                    f"complete() instead. force_search is a no-op on this "
-                    f"transport."
-                )
-                result = _call_complete()
-            else:
-                log.warning(
-                    f"provider={llm_client.spec.provider!r} cannot force "
-                    f"web_search via tool_choice (SearchOptions.force_first "
-                    f"unsupported on this transport) — retrying the recovery "
-                    f"pass with prose-only forcing. Coverage on this pass is "
-                    f"best-effort, NOT hard-guaranteed the way it is on the "
-                    f"anthropic transport."
-                )
-                result = _call_grounded(force=False)
-        elif llm_client.spec.provider not in _PROVIDERS_WITH_WEB_SEARCH:
-            log.info(
-                f"provider={llm_client.spec.provider!r} does not support "
-                f"server-side web search — using news-context-grounded "
-                f"complete() instead."
-            )
-            result = _call_complete()
-        else:
-            raise
+    result = call_with_grounding_degrade(
+        llm_client, config, prompt_text, user_content,
+        force_search=force_search,
+    )
 
     cost = record_result_cost(
         result=result,
@@ -993,6 +1096,11 @@ def generate_script(
                 f"{primary_spec.model!r} aborted ({primary_failed_exc}) — "
                 f"falling back to the fallback spec."
             )
+            if _is_deployment_class_failure(primary_failed_exc):
+                _alert_primary_never_usable(
+                    config, edition, primary_spec, primary_failed_exc,
+                    friendly_date=friendly_date, edition_label=edition_label,
+                )
         else:
             log.error(
                 f"{edition_label} edition for {friendly_date}: primary "
