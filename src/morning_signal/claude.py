@@ -201,11 +201,139 @@ def resolve_fallback_spec(config: dict) -> ModelSpec:
     return _anthropic_default_spec(config)
 
 
+class RouterGroupUnresolvable(RuntimeError):
+    """The configured spec names a krepis router group that could not be
+    resolved into a callable endpoint from this deployment.
+
+    A distinct type because the cascade must treat it as a *deployment*
+    failure — permanent until something is changed here — rather than as a
+    provider that was called and failed. See
+    :func:`_is_deployment_class_failure`.
+    """
+
+
+#: Provider names in the ``llm`` config that mean "a krepis router group",
+#: resolved through the authenticated router edge rather than called directly.
+#:
+#: ``router`` is the intended spelling. ``litellm`` is accepted because it is
+#: what production's SSM config already says, and because a consumer naming it
+#: is ALWAYS making the same mistake: in ``krepis.llm_config.PROVIDER_REGISTRY``
+#: that name binds to ``TRANSPORT_LITELLM``, an in-process LiteLLM Router that
+#: calls each provider directly from the consumer. krepis states the objection
+#: in its own source (``router.py``, above ``resolve_group_spec``): that path
+#: egresses straight to openrouter.ai unscanned — the linkage
+#: alpha-engine-config-I6367 forbids — bypasses the authenticated edge so
+#: per-consumer identity and rate limiting never apply, and requires the
+#: ``litellm`` package plus a readable registry inside every consumer.
+#:
+#: Accepting the legacy name is what lets this migration land without an
+#: operator editing ``/morning-signal/config-yaml`` first — a PR must be
+#: deployable by the merge button alone.
+_ROUTER_GROUP_PROVIDERS = frozenset({"router", "litellm"})
+
+
+def _resolve_router_group(spec: ModelSpec, config: dict) -> ModelSpec:
+    """Turn a router-group spec into one addressing the authenticated edge.
+
+    ``krepis.router.resolve_group_spec`` returns a ``ModelSpec`` carrying the
+    edge's ``base_url`` and this consumer's ``api_key_env`` — `(url,
+    credential)` and nothing else, which is the whole of what
+    `model-router-policy` R27a says a consumer may need to know about the
+    router. The model actually served, its fallback chain, and the per-provider
+    endpoints are all decided above us and walked server-side by the proxy.
+
+    Raises :exc:`RouterGroupUnresolvable` rather than degrading to anything.
+    R20 is explicit that a failed resolution fails closed: falling through to a
+    default endpoint or an ambient key spends real money on a route nobody
+    chose. The caller engages the configured fallback and alerts.
+    """
+    try:
+        from krepis.router import resolve_group_spec
+    except ImportError as exc:  # pragma: no cover - krepis is a hard dependency
+        raise RouterGroupUnresolvable(
+            f"krepis.router is unavailable, so router group {spec.model!r} "
+            f"cannot be resolved: {exc}"
+        ) from exc
+
+    # Declared, never inferred (R29). The value is supplied by the unit
+    # (`KREPIS_EXEC_CONTEXT=ec2` on the dashboard box); passing None hands the
+    # decision to krepis's own documented default rather than guessing here
+    # from a hostname or a metadata lookup.
+    exec_context = os.environ.get("KREPIS_EXEC_CONTEXT") or None
+    try:
+        edge_spec, route = resolve_group_spec(
+            spec.model,
+            exec_context=exec_context,
+            max_tokens=spec.max_tokens or config.get("max_tokens", 4096),
+        )
+    except Exception as exc:
+        raise RouterGroupUnresolvable(
+            f"router group {spec.model!r} did not resolve "
+            f"(exec_context={exec_context!r}): {exc}"
+        ) from exc
+
+    # Resolution SUCCEEDING is not the same as resolving to the router.
+    #
+    # krepis admits the `litellm_proxy` route only if its health probe passes
+    # AND this consumer's credential resolves; when either fails the route is
+    # skipped and resolution continues down the chain to a DIRECT provider
+    # entry — for the `high` group, OpenRouter. That is a legitimate krepis
+    # behaviour and a forbidden outcome here: alpha-engine-config-I6367 rules
+    # out direct OpenRouter linkage, and the whole reason this repo addresses
+    # a group by name is to stop choosing providers itself.
+    #
+    # So an unprovisioned credential must look like "unresolvable", not like
+    # "resolved to something callable". Without this check the migration would
+    # land looking successful and quietly reproduce the exact behaviour it was
+    # written to end.
+    if route.get("route") != "litellm_proxy":
+        raise RouterGroupUnresolvable(
+            f"router group {spec.model!r} resolved to route "
+            f"{route.get('route')!r} (provider={edge_spec.provider!r}), not the "
+            f"authenticated router edge — refusing to call a direct provider "
+            f"chosen by fallback (alpha-engine-config-I6367)"
+        )
+
+    log.info(
+        "router group %r resolved to provider=%r model=%r route=%r",
+        spec.model, edge_spec.provider, edge_spec.model, route.get("route"),
+    )
+    return edge_spec
+
+
 def resolve_llm_spec(config: dict) -> ModelSpec:
     """The active ModelSpec: env override → config ``llm`` → legacy default.
 
-    The legacy default (anthropic + ``claude_model``) keeps every
+    A spec naming a router group (see :data:`_ROUTER_GROUP_PROVIDERS`) is
+    resolved through ``krepis.router`` into one addressing the authenticated
+    router edge. The legacy default (anthropic + ``claude_model``) keeps every
     pre-migration config behavior-identical.
+
+    :raises RouterGroupUnresolvable: the spec names a router group that could
+        not be resolved. Deliberately not caught here — see
+        :func:`_resolve_router_group`.
+    """
+    env_value = os.environ.get(LLM_ENV_VAR)
+    if env_value:
+        spec = parse_model_spec(env_value, source=f"env {LLM_ENV_VAR}")
+    else:
+        configured = config.get("llm")
+        if not configured:
+            return _anthropic_default_spec(config)
+        spec = parse_model_spec(str(configured), source="config 'llm'")
+
+    if spec.provider in _ROUTER_GROUP_PROVIDERS:
+        return _resolve_router_group(spec, config)
+    return spec
+
+
+def declared_llm_spec(config: dict) -> ModelSpec:
+    """The ``llm`` spec exactly as configured, with no router resolution.
+
+    What the decision log should record as the PRIMARY even when resolution
+    failed: `{"provider": "litellm", "model": "high"}` is what the operator
+    asked for, and reporting the fallback in its place would erase the fact
+    that the configured primary was never reachable.
     """
     env_value = os.environ.get(LLM_ENV_VAR)
     if env_value:
@@ -293,7 +421,10 @@ def _is_deployment_class_failure(exc: BaseException) -> bool:
     cursor: BaseException | None = exc
     while cursor is not None and id(cursor) not in seen:
         seen.add(id(cursor))
-        if isinstance(cursor, ImportError):  # covers ModuleNotFoundError
+        # ImportError covers ModuleNotFoundError; RouterGroupUnresolvable means
+        # the configured group never produced a callable endpoint here, which
+        # is the same category — nothing about the next run will differ.
+        if isinstance(cursor, (ImportError, RouterGroupUnresolvable)):
             return True
         cursor = cursor.__cause__ or cursor.__context__
     return False
@@ -1054,7 +1185,17 @@ def generate_script(
     back to. Either way, :func:`_record_llm_decision`
     logs which model actually produced (or failed to produce) the script.
     """
-    primary_spec = resolve_llm_spec(config)
+    # A router group that will not resolve is a primary failure BEFORE any
+    # call is made, not a reason to abort the episode: the configured fallback
+    # is exactly what should carry it. The declared spec is kept so the
+    # decision log still records what was asked for.
+    primary_spec = declared_llm_spec(config)
+    unresolvable_exc: Exception | None = None
+    try:
+        primary_spec = resolve_llm_spec(config)
+    except RouterGroupUnresolvable as exc:
+        unresolvable_exc = exc
+
     req = build_episode_request(config, date_str, edition, schedule_entry)
     prompt_text = req["prompt_text"]
     user_content = req["user_content"]
@@ -1072,17 +1213,21 @@ def generate_script(
         and not os.environ.get(LLM_ENV_VAR)
     )
 
-    primary_client = LLMClient(primary_spec, callsite_id="morning-signal-episode-primary", max_retries=5)
     primary_failed_exc: Exception | None = None
-    try:
-        script, outcome = _attempt_episode(
-            primary_client, config, prompt_text, user_content, date_str,
-            edition, required_topics, effective_edition, edition_label,
-            friendly_date,
-        )
-    except Exception as exc:
+    if unresolvable_exc is not None:
         script, outcome = "", None
-        primary_failed_exc = exc
+        primary_failed_exc = unresolvable_exc
+    else:
+        primary_client = LLMClient(primary_spec, callsite_id="morning-signal-episode-primary", max_retries=5)
+        try:
+            script, outcome = _attempt_episode(
+                primary_client, config, prompt_text, user_content, date_str,
+                edition, required_topics, effective_edition, edition_label,
+                friendly_date,
+            )
+        except Exception as exc:
+            script, outcome = "", None
+            primary_failed_exc = exc
 
     used_spec = primary_spec
     fell_back = False

@@ -179,6 +179,34 @@ def _maybe_load_from_ssm() -> None:
         if openrouter_key:
             os.environ["OPENROUTER_API_KEY"] = openrouter_key
 
+    # This consumer's router-edge credential. The authenticated edge
+    # identifies each consumer BY its credential value (nginx maps it to an
+    # X-Router-Consumer header), so it must be morning-signal's own and never
+    # a shared key — a shared value collapses every consumer into one identity
+    # and makes revoking one revoke all.
+    #
+    # Materialized into the environment under the name the unit declares in
+    # KREPIS_ROUTER_CREDENTIAL_SECRET, so krepis resolves it from os.environ on
+    # both legs that need it: route admission and the call itself. That matters
+    # — alpha-engine-config-I6414 was those two legs disagreeing about which
+    # credential this consumer had, which rejected a correctly-configured
+    # consumer before its credential was ever consulted, and took the Think
+    # Tank box down.
+    #
+    # Optional: an install with no router provisioned simply has no parameter,
+    # and a router-group `llm` spec then fails to resolve and engages the
+    # configured fallback with an alert (claude.RouterGroupUnresolvable).
+    router_secret_name = os.environ.get(
+        "KREPIS_ROUTER_CREDENTIAL_SECRET", "ROUTER_CONSUMER_MORNINGSIGNAL"
+    )
+    if not os.environ.get(router_secret_name):
+        router_credential = fetch_optional("/morning-signal/router-credential")
+        if router_credential:
+            os.environ[router_secret_name] = router_credential
+            log.info(
+                f"SSM: router-edge credential loaded as {router_secret_name}"
+            )
+
     # Flow-doctor / Telegram creds. Local env-var overrides win (so
     # one-off local debugging stays cheap); SSM fills in otherwise.
     # Optional — installs with notifications.enabled=false don't need

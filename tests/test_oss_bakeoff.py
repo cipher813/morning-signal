@@ -139,6 +139,16 @@ def test_prod_side_survives_a_spec_with_no_server_side_web_search(
     from krepis.llm_config import LLMConfigError
 
     monkeypatch.setenv("MORNING_SIGNAL_LLM", '{"provider": "litellm", "model": "high"}')
+    edge_spec = ModelSpec(
+        "litellm_proxy", "high",
+        base_url="https://router.nousergon.ai:8443",
+        api_key_env="ROUTER_CONSUMER_MORNINGSIGNAL",
+        max_tokens=4096,
+    )
+    monkeypatch.setattr(
+        "krepis.router.resolve_group_spec",
+        lambda group, **kw: (edge_spec, {"route": "litellm_proxy"}),
+    )
 
     plan = _all_pass_plan()
 
@@ -147,10 +157,11 @@ def test_prod_side_survives_a_spec_with_no_server_side_web_search(
             self.spec = spec
 
         def complete_grounded(self, **kw):
-            if self.spec.provider == "litellm":
+            if self.spec.provider == "litellm_proxy":
                 raise LLMConfigError(
                     "complete_grounded is only supported on the anthropic "
-                    "provider or openrouter; provider 'litellm' has neither."
+                    "provider or openrouter; provider 'litellm_proxy' has "
+                    "neither."
                 )
             return plan[self.spec.model]
 
@@ -159,7 +170,7 @@ def test_prod_side_survives_a_spec_with_no_server_side_web_search(
                 "the prod side must degrade the same way production does"
             )
             grounded = _grounded(
-                provider="litellm", model="high",
+                provider="litellm_proxy", model="high",
                 unmet_hit=False, web_search_requests=0,
             )
             return LLMResult(
@@ -177,7 +188,7 @@ def test_prod_side_survives_a_spec_with_no_server_side_web_search(
 
     record = bakeoff_module.run_bakeoff(load_config(), "2026-07-06", "am")
 
-    assert record["prod"]["provider"] == "litellm"
+    assert record["prod"]["provider"] == "litellm_proxy"
     assert record["prod"]["model"] == "high"
     # A no-web-search transport reports zero searches by construction; the
     # comparison still ran, which is the whole point of the regression.

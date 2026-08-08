@@ -82,7 +82,21 @@ dependencies = [
     # 2026-07-27 while `Publish to PyPI` kept shipping (morning-signal-I132).
     # Raise this deliberately after reading krepis's changelog, never by
     # deleting the ceiling.
-    "krepis[anthropic,openai]>=0.24.0,<0.26.0",
+    # Raised 0.24 -> 0.36 on 2026-08-08 for `krepis.router.resolve_group_spec`
+    # and the per-consumer `KREPIS_ROUTER_CREDENTIAL_SECRET` override
+    # (alpha-engine-config-I6414) — together they are what lets this repo
+    # address the AUTHENTICATED ROUTER EDGE by (url, credential) instead of
+    # constructing an in-process LiteLLM Router that egresses to providers
+    # directly (alpha-engine-config-I6567). The `callsite_id` break the
+    # original ceiling was pinned against is already satisfied: every
+    # LLMClient construction here passes it. Verified by running the full
+    # suite against 0.36.0 before raising the floor — 363 passed.
+    #
+    # The FLOOR is what matters here, not just the ceiling. The box's
+    # ExecStartPre runs `pip install -e .`, which leaves an
+    # already-constraint-satisfying version alone; with the old `>=0.24.0` the
+    # box sat on 0.24.2 indefinitely and never saw a newer krepis.
+    "krepis[anthropic,openai]>=0.36.0,<0.37.0",
     "pydantic>=2.0",
     # Pydantic v2 cannot eval PEP 604 `str | None` field annotations under
     # Python 3.9 even with `from __future__ import annotations` (mirrors krepis).

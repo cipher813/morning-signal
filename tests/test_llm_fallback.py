@@ -20,6 +20,7 @@ import json
 
 import pytest
 from krepis.llm import GroundedResult, LLMUsage
+from krepis.llm_config import ModelSpec
 
 from morning_signal import claude
 
@@ -506,14 +507,194 @@ def test_decision_log_sync_failure_does_not_block_publish(monkeypatch, tmp_path)
 # tests lock the cascade behaviour for that path.
 
 
-def test_litellm_primary_succeeds_via_complete(monkeypatch, tmp_path):
-    """A litellm primary (krepis model group) produces a script through
-    complete() — no web-search grounding check fires, no cascade needed.
+def test_router_group_resolves_to_the_authenticated_edge(monkeypatch, tmp_path):
+    """A router-group `llm` spec is resolved through `krepis.router`, not
+    handed to the in-process LiteLLM transport.
+
+    `provider: litellm` in config means "the krepis `high` group"; what must
+    reach `LLMClient` is the EDGE — `provider=litellm_proxy` with the edge's
+    base_url and this consumer's credential name. Resolving it to the
+    in-process Router instead is alpha-engine-config-I6367's forbidden
+    linkage, and is what production silently did until 2026-08-08.
     """
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    edge_spec = ModelSpec(
+        "litellm_proxy", "high",
+        base_url="https://router.nousergon.ai:8443",
+        api_key_env="ROUTER_CONSUMER_MORNINGSIGNAL",
+        max_tokens=4096,
+    )
+    seen: dict = {}
+
+    def _fake_resolve(group, *, exec_context=None, max_tokens=None, **kw):
+        seen["group"] = group
+        seen["exec_context"] = exec_context
+        return edge_spec, {"route": "litellm_proxy"}
+
+    monkeypatch.setattr("krepis.router.resolve_group_spec", _fake_resolve)
+    monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ec2")
+
     plan = {
-        "litellm": [
-            _grounded(provider="litellm", model="deepseek-v4-pro",
+        "litellm_proxy": [
+            _grounded(provider="litellm_proxy", model="deepseek-v4-pro",
+                      text="Welcome to Morning Signal. Edge-served content.",
+                      n_searches=0, citations=[]),
+        ],
+    }
+    monkeypatch.setattr(claude, "LLMClient", _client_factory(plan))
+
+    script = claude.generate_script(
+        _base_config(
+            llm='{"provider": "litellm", "model": "high"}',
+            min_grounding_citations=0,
+        ),
+        "2026-08-08", "am",
+    )
+
+    assert "Edge-served content" in script
+    assert seen == {"group": "high", "exec_context": "ec2"}
+    decision = json.loads(_decision_path(tmp_path, "2026-08-08").read_text())
+    assert decision["primary_provider"] == "litellm_proxy"
+    assert decision["fell_back"] is False
+
+
+def test_unresolvable_router_group_falls_back_and_alerts(monkeypatch, tmp_path):
+    """Resolution failing is a DEPLOYMENT failure, not a provider one.
+
+    R20 (`model-router-policy`) says a failed resolution fails closed rather
+    than falling through to a default endpoint or an ambient key. Closed here
+    means: do not call the group at all, run the configured fallback, and say
+    so — the same treatment a primary that was never installed gets, because
+    nothing about the next run will differ either.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    def _fake_resolve(group, **kw):
+        raise RuntimeError("no reachable entry for group 'high'")
+
+    monkeypatch.setattr("krepis.router.resolve_group_spec", _fake_resolve)
+
+    class _AnthropicOnly:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+            assert spec.provider != "litellm", (
+                "an unresolvable group must never be handed to the in-process "
+                "LiteLLM transport"
+            )
+
+        def complete_grounded(self, **kw):
+            return _grounded(
+                provider="anthropic", model="claude-haiku-4-5",
+                text="Welcome to Morning Signal. Aired on the fallback.",
+                n_searches=4,
+            )
+
+    monkeypatch.setattr(claude, "LLMClient", _AnthropicOnly)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
+
+    script = claude.generate_script(
+        _base_config(llm='{"provider": "litellm", "model": "high"}'),
+        "2026-08-08", "am",
+    )
+
+    assert "Aired on the fallback" in script
+    assert len(sent) == 1
+    assert "never callable from this deployment" in sent[0]
+    decision = json.loads(_decision_path(tmp_path, "2026-08-08").read_text())
+    # The decision log records what was ASKED FOR as the primary; reporting
+    # the fallback there would erase the fact that it was never reachable.
+    assert decision["primary_provider"] == "litellm"
+    assert decision["primary_model"] == "high"
+    assert decision["used_provider"] == "anthropic"
+    assert decision["fell_back"] is True
+
+
+def test_group_resolving_to_a_direct_provider_is_refused(monkeypatch, tmp_path):
+    """Resolving to a DIRECT provider is a failure, not a success.
+
+    krepis skips the `litellm_proxy` route when its health probe fails or this
+    consumer's credential does not resolve, and continues down the chain to a
+    direct entry — for `high`, OpenRouter. Accepting that would reproduce the
+    exact linkage alpha-engine-config-I6367 forbids, while looking like a
+    working migration.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    direct_spec = ModelSpec(
+        "openrouter", "deepseek/deepseek-v4-pro",
+        api_key_env="OPENROUTER_API_KEY", max_tokens=4096,
+    )
+    monkeypatch.setattr(
+        "krepis.router.resolve_group_spec",
+        lambda group, **kw: (direct_spec, {"route": "direct"}),
+    )
+
+    class _AnthropicOnly:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+            assert spec.provider == "anthropic", (
+                f"only the configured fallback may be called, got {spec.provider!r}"
+            )
+
+        def complete_grounded(self, **kw):
+            return _grounded(
+                provider="anthropic", model="claude-haiku-4-5",
+                text="Welcome to Morning Signal. Aired on the fallback.",
+                n_searches=4,
+            )
+
+    monkeypatch.setattr(claude, "LLMClient", _AnthropicOnly)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
+
+    script = claude.generate_script(
+        _base_config(llm='{"provider": "litellm", "model": "high"}'),
+        "2026-08-08", "am",
+    )
+
+    assert "Aired on the fallback" in script
+    assert len(sent) == 1
+    decision = json.loads(_decision_path(tmp_path, "2026-08-08").read_text())
+    assert decision["used_provider"] == "anthropic"
+
+
+def test_router_group_primary_succeeds_via_complete(monkeypatch, tmp_path):
+    """A router-group primary produces a script through complete() — no
+    web-search grounding check fires, no cascade needed.
+
+    The edge speaks OpenAI-compatible chat completions and has no server-side
+    web search, so grounding comes from the pre-fetched news_context digest.
+    Was `test_litellm_primary_succeeds_via_complete`, asserting
+    `used_provider == "litellm"` — the in-process Router. That assertion
+    locked in the linkage alpha-engine-config-I6367 forbids; the degrade
+    behaviour it was really testing is what survives here.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    edge_spec = ModelSpec(
+        "litellm_proxy", "high",
+        base_url="https://router.nousergon.ai:8443",
+        api_key_env="ROUTER_CONSUMER_MORNINGSIGNAL",
+        max_tokens=4096,
+    )
+    monkeypatch.setattr(
+        "krepis.router.resolve_group_spec",
+        lambda group, **kw: (edge_spec, {"route": "litellm_proxy"}),
+    )
+
+    plan = {
+        "litellm_proxy": [
+            _grounded(provider="litellm_proxy", model="deepseek-v4-pro",
                       text="Welcome to Morning Signal. High-group content.",
                       n_searches=0, citations=[]),
         ],
@@ -533,8 +714,8 @@ def test_litellm_primary_succeeds_via_complete(monkeypatch, tmp_path):
 
     assert "High-group content" in script
     decision = json.loads(_decision_path(tmp_path, "2026-08-02").read_text())
-    assert decision["primary_provider"] == "litellm"
-    assert decision["used_provider"] == "litellm"
+    assert decision["primary_provider"] == "litellm_proxy"
+    assert decision["used_provider"] == "litellm_proxy"
     assert decision["fell_back"] is False
 
 
@@ -546,6 +727,12 @@ def test_primary_unusable_in_this_deployment_alerts(monkeypatch, tmp_path):
     Each episode logged the abort and then published on the OpenRouter
     fallback, so the only failure surface — the episode not appearing — never
     fired. The episode still ships; the point is that somebody is told.
+
+    That exact spec can no longer be constructed — a router group now resolves
+    to the edge — so the missing-transport-package case is exercised here on
+    an OpenRouter primary, which is the same category and still reachable.
+    Its router-group sibling is
+    ``test_unresolvable_router_group_falls_back_and_alerts``.
     """
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
 
@@ -554,8 +741,8 @@ def test_primary_unusable_in_this_deployment_alerts(monkeypatch, tmp_path):
             self.spec = spec
 
         def complete_grounded(self, **kw):
-            if self.spec.provider == "litellm":
-                raise ModuleNotFoundError("No module named 'litellm'")
+            if self.spec.provider == "openrouter":
+                raise ModuleNotFoundError("No module named 'openai'")
             return _grounded(
                 provider="anthropic", model="claude-haiku-4-5",
                 text="Welcome to Morning Signal. Aired on the fallback.",
@@ -563,7 +750,7 @@ def test_primary_unusable_in_this_deployment_alerts(monkeypatch, tmp_path):
             )
 
         def complete(self, **kw):
-            raise ModuleNotFoundError("No module named 'litellm'")
+            raise ModuleNotFoundError("No module named 'openai'")
 
     monkeypatch.setattr(claude, "LLMClient", _PrimaryNotInstalled)
 
@@ -573,15 +760,12 @@ def test_primary_unusable_in_this_deployment_alerts(monkeypatch, tmp_path):
         lambda config, edition, message: sent.append(message) or True,
     )
 
-    script = claude.generate_script(
-        _base_config(llm='{"provider": "litellm", "model": "high"}'),
-        "2026-08-08", "am",
-    )
+    script = claude.generate_script(_base_config(), "2026-08-08", "am")
 
     assert "Aired on the fallback" in script
     assert len(sent) == 1, "a permanently-unusable primary must raise exactly one alert"
     assert "never callable from this deployment" in sent[0]
-    assert "litellm" in sent[0]
+    assert "openrouter" in sent[0]
 
 
 def test_ordinary_provider_failure_does_not_alert(monkeypatch, tmp_path):
