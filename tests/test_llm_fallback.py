@@ -611,9 +611,13 @@ def test_unresolvable_router_group_falls_back_and_alerts(monkeypatch, tmp_path):
     assert len(sent) == 1
     assert "never callable from this deployment" in sent[0]
     decision = json.loads(_decision_path(tmp_path, "2026-08-08").read_text())
-    # The decision log records what was ASKED FOR as the primary; reporting
-    # the fallback there would erase the fact that it was never reachable.
-    assert decision["primary_provider"] == "litellm"
+    # The decision log records the DECLARED primary, not the fallback —
+    # reporting the fallback there would erase the fact that the configured
+    # primary was never reachable. The provider is normalised to `router`
+    # (the legacy `litellm` spelling names an in-process transport krepis
+    # refuses to construct); the group is preserved exactly, which is the
+    # half that matters for diagnosis.
+    assert decision["primary_provider"] == "router"
     assert decision["primary_model"] == "high"
     assert decision["used_provider"] == "anthropic"
     assert decision["fell_back"] is True

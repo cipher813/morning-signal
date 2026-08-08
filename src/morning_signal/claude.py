@@ -322,18 +322,38 @@ def resolve_llm_spec(config: dict) -> ModelSpec:
         not be resolved. Deliberately not caught here — see
         :func:`_resolve_router_group`.
     """
-    env_value = os.environ.get(LLM_ENV_VAR)
-    if env_value:
-        spec = parse_model_spec(env_value, source=f"env {LLM_ENV_VAR}")
-    else:
-        configured = config.get("llm")
-        if not configured:
-            return _anthropic_default_spec(config)
-        spec = parse_model_spec(str(configured), source="config 'llm'")
+    declared = declared_llm_spec(config)
+    if declared.provider in _ROUTER_GROUP_PROVIDERS:
+        return _resolve_router_group(declared, config)
+    return declared
 
-    if spec.provider in _ROUTER_GROUP_PROVIDERS:
-        return _resolve_router_group(spec, config)
-    return spec
+
+def _router_group_from_raw(raw: str) -> str | None:
+    """The group name when *raw* is a router-group spec, else ``None``.
+
+    Read WITHOUT going through ``parse_model_spec``, and that is the point:
+    krepis refuses to construct a ``ModelSpec(provider="litellm")`` at all (it
+    selects the in-process Router — see :data:`_ROUTER_GROUP_PROVIDERS`), so
+    parsing production's live config value through it would raise before this
+    module ever got to decide what the value MEANS. Reading the two fields
+    here keeps the legacy spelling working against every krepis version,
+    including the ones that refuse it.
+    """
+    text = raw.strip()
+    provider = model = None
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(obj, dict):
+            provider, model = obj.get("provider"), obj.get("model")
+    elif text.count(":") == 1:
+        provider, _, model = text.partition(":")
+
+    if provider in _ROUTER_GROUP_PROVIDERS and model:
+        return str(model)
+    return None
 
 
 def declared_llm_spec(config: dict) -> ModelSpec:
@@ -343,14 +363,26 @@ def declared_llm_spec(config: dict) -> ModelSpec:
     failed: `{"provider": "litellm", "model": "high"}` is what the operator
     asked for, and reporting the fallback in its place would erase the fact
     that the configured primary was never reachable.
+
+    A router group is normalised to ``provider="router"`` — a name krepis does
+    not know, so it constructs as an inert custom spec rather than selecting a
+    transport. Nothing calls it; it exists to be RECORDED and to be recognised
+    by :func:`resolve_llm_spec`.
     """
-    env_value = os.environ.get(LLM_ENV_VAR)
-    if env_value:
-        return parse_model_spec(env_value, source=f"env {LLM_ENV_VAR}")
-    configured = config.get("llm")
-    if configured:
-        return parse_model_spec(str(configured), source="config 'llm'")
-    return _anthropic_default_spec(config)
+    raw = os.environ.get(LLM_ENV_VAR)
+    source = f"env {LLM_ENV_VAR}"
+    if not raw:
+        configured = config.get("llm")
+        if not configured:
+            return _anthropic_default_spec(config)
+        raw, source = str(configured), "config 'llm'"
+
+    group = _router_group_from_raw(raw)
+    if group is not None:
+        return ModelSpec(
+            "router", group, max_tokens=config.get("max_tokens", 4096)
+        )
+    return parse_model_spec(raw, source=source)
 
 EDITION_LABELS = {"am": "MORNING", "pm": "EVENING"}
 
