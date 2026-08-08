@@ -150,26 +150,30 @@ def test_n_searches_falls_back_to_usage_when_searches_empty(patched):
     assert n_searches == 5
 
 
-def test_litellm_falls_through_to_complete_when_grounded_unsupported(patched):
-    """litellm (and any non-anthropic/openrouter provider) has no server-side
-    web_search — complete_grounded raises LLMConfigError and the path falls
-    through to complete(), wrapping the plain text result as a GroundedResult
-    with empty searches/citations. Grounding then comes from the pre-fetched
-    news_context digest injected by build_episode_request.
+def test_router_edge_falls_through_to_complete_when_grounded_unsupported(patched):
+    """The router edge (and any non-anthropic/openrouter provider) has no
+    server-side web_search — complete_grounded raises LLMConfigError and the
+    path falls through to complete(), wrapping the plain text result as a
+    GroundedResult with empty searches/citations. Grounding then comes from the
+    pre-fetched news_context digest injected by build_episode_request.
+
+    Was written against `ModelSpec("litellm", ...)`, the IN-PROCESS Router.
+    krepis refuses to construct that spec at all, and production no longer
+    builds one — `litellm_proxy` is what a resolved router group looks like.
     """
     from types import SimpleNamespace
 
     complete_result = SimpleNamespace(
         text="Welcome to Morning Signal. News-context grounded.",
         model="deepseek-v4-pro",
-        provider="litellm",
+        provider="litellm_proxy",
         usage=LLMUsage(),
         raw_request={},
         raw_response=None,
     )
     client = _FakeLLMClient(
-        ModelSpec("litellm", "high"),
-        plan=[LLMConfigError("complete_grounded unsupported on litellm")],
+        ModelSpec("litellm_proxy", "high", base_url="https://router.example:8443", api_key_env="ROUTER_CONSUMER_TEST"),
+        plan=[LLMConfigError("complete_grounded unsupported on litellm_proxy")],
         complete_plan=[complete_result],
     )
 
@@ -178,7 +182,7 @@ def test_litellm_falls_through_to_complete_when_grounded_unsupported(patched):
     )
 
     assert result.text == "Welcome to Morning Signal. News-context grounded."
-    assert result.provider == "litellm"
+    assert result.provider == "litellm_proxy"
     assert result.model == "deepseek-v4-pro"
     assert result.searches == []
     assert result.citations == []
@@ -187,7 +191,7 @@ def test_litellm_falls_through_to_complete_when_grounded_unsupported(patched):
     assert client.force_first_calls == [False]
 
 
-def test_litellm_force_search_is_noop_via_complete(patched):
+def test_router_edge_force_search_is_noop_via_complete(patched):
     """force_search=True on a non-web-search transport must not raise —
     force is a no-op and complete() still produces the script.
     """
@@ -196,14 +200,14 @@ def test_litellm_force_search_is_noop_via_complete(patched):
     complete_result = SimpleNamespace(
         text="ok",
         model="deepseek-v4-pro",
-        provider="litellm",
+        provider="litellm_proxy",
         usage=LLMUsage(),
         raw_request={},
         raw_response=None,
     )
     client = _FakeLLMClient(
-        ModelSpec("litellm", "high"),
-        plan=[LLMConfigError("complete_grounded unsupported on litellm")],
+        ModelSpec("litellm_proxy", "high", base_url="https://router.example:8443", api_key_env="ROUTER_CONSUMER_TEST"),
+        plan=[LLMConfigError("complete_grounded unsupported on litellm_proxy")],
         complete_plan=[complete_result],
     )
 
