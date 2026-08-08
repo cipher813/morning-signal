@@ -72,12 +72,16 @@ from pathlib import Path
 # ``python scripts/oss_bakeoff.py`` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from krepis.llm import LLMClient, SearchOptions  # noqa: E402
+from krepis.llm import LLMClient  # noqa: E402
 from krepis.llm_config import ModelSpec  # noqa: E402
 
 from morning_signal import aws as _aws  # noqa: E402
 from morning_signal.aws import _aws_client, _maybe_load_from_ssm  # noqa: E402
-from morning_signal.claude import build_episode_request, resolve_llm_spec  # noqa: E402
+from morning_signal.claude import (  # noqa: E402
+    build_episode_request,
+    call_with_grounding_degrade,
+    resolve_llm_spec,
+)
 from morning_signal.config import load_config  # noqa: E402
 from morning_signal.search_telemetry import unmet_required_topics  # noqa: E402
 
@@ -128,17 +132,27 @@ def _run_side(
     required_topics: list[dict],
     effective_edition: str,
 ) -> dict:
-    """Issue one grounded call on ``spec`` and score it against the SAME
+    """Issue one generation call on ``spec`` and score it against the SAME
     coverage guards the production path enforces (see ``claude.py``).
+
+    The call goes through ``claude.call_with_grounding_degrade`` — the exact
+    helper the live episode calls — rather than a local ``complete_grounded``.
+    The local copy lacked production's degrade-to-``complete()`` branch for a
+    transport with no server-side web search, so when the production ``llm``
+    spec moved to a krepis router group (#135, merged 2026-08-02) the prod
+    side of this comparison began raising ``LLMConfigError`` — exit 1 on every
+    weekly run from 2026-08-05 — while production itself kept airing. A shadow
+    bakeoff that cannot exercise the spec production actually uses measures
+    nothing.
+
+    What is deliberately NOT shared is ``_invoke_and_record``'s telemetry:
+    that writes to ``episodes/{date}-{edition}.cost.jsonl`` and the episode's
+    search/SFT sinks, and these calls are never published. Mixing them into
+    the aired episode's billed-cost record is precisely what
+    ``BAKEOFF_LOG_DIR_ENV`` exists to prevent.
     """
     client = LLMClient(spec, callsite_id="morning-signal-oss-bakeoff", max_retries=3)
-    result = client.complete_grounded(
-        system=prompt_text,
-        user_content=user_content,
-        search=SearchOptions(max_uses=config.get("web_search_max_uses", 20)),
-        max_tokens=config.get("max_tokens", 4096),
-        cache_system=True,
-    )
+    result = call_with_grounding_degrade(client, config, prompt_text, user_content)
     # Provider-agnostic search count — mirrors claude._invoke_and_record.
     n_searches = max(len(result.searches), result.usage.web_search_requests)
     unmet = unmet_required_topics(
