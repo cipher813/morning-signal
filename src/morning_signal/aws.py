@@ -203,8 +203,16 @@ def _maybe_load_from_ssm() -> None:
         router_credential = fetch_optional("/morning-signal/router-credential")
         if router_credential:
             os.environ[router_secret_name] = router_credential
+            # The NAME is not interpolated into the message, even though it
+            # carries no secret. `py/clear-text-logging-sensitive-data` matches
+            # on the identifier, so passing it raises a high-severity alert
+            # that says nothing — and an alert list containing a known-false
+            # entry is one nobody reads. Same treatment krepis gives the same
+            # rule for the same variable. The declared name is visible in the
+            # unit's `KREPIS_ROUTER_CREDENTIAL_SECRET` either way.
             log.info(
-                f"SSM: router-edge credential loaded as {router_secret_name}"
+                "SSM: router-edge credential loaded into the environment "
+                "under the name declared by KREPIS_ROUTER_CREDENTIAL_SECRET"
             )
 
     # Flow-doctor / Telegram creds. Local env-var overrides win (so
