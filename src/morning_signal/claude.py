@@ -264,6 +264,15 @@ def _resolve_router_group(spec: ModelSpec, config: dict) -> ModelSpec:
         edge_spec, route = resolve_group_spec(
             spec.model,
             exec_context=exec_context,
+            # REQUIRED, not a default worth inheriting: krepis' DEFAULT_WIRE is
+            # WIRE_ANTHROPIC. The router edge speaks OpenAI-compatible chat
+            # completions, and every entry a fallback could substitute here is
+            # reached the same way — so asking for the anthropic wire lets the
+            # resolver hand back a URL this transport cannot speak, and the
+            # failure surfaces as a malformed request rather than as a routing
+            # decision. Mirrors alpha-engine-research's `single_agent.py`
+            # challenger call site, which passes it explicitly for this reason.
+            wire="openai",
             max_tokens=spec.max_tokens or config.get("max_tokens", 4096),
         )
     except Exception as exc:

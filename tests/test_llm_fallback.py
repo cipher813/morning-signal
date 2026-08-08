@@ -527,9 +527,10 @@ def test_router_group_resolves_to_the_authenticated_edge(monkeypatch, tmp_path):
     )
     seen: dict = {}
 
-    def _fake_resolve(group, *, exec_context=None, max_tokens=None, **kw):
+    def _fake_resolve(group, *, exec_context=None, max_tokens=None, wire=None, **kw):
         seen["group"] = group
         seen["exec_context"] = exec_context
+        seen["wire"] = wire
         return edge_spec, {"route": "litellm_proxy"}
 
     monkeypatch.setattr("krepis.router.resolve_group_spec", _fake_resolve)
@@ -553,7 +554,10 @@ def test_router_group_resolves_to_the_authenticated_edge(monkeypatch, tmp_path):
     )
 
     assert "Edge-served content" in script
-    assert seen == {"group": "high", "exec_context": "ec2"}
+    # `wire` is asserted because krepis' DEFAULT_WIRE is WIRE_ANTHROPIC —
+    # inheriting it would let a substituted entry return a URL this
+    # OpenAI-compatible transport cannot speak.
+    assert seen == {"group": "high", "exec_context": "ec2", "wire": "openai"}
     decision = json.loads(_decision_path(tmp_path, "2026-08-08").read_text())
     assert decision["primary_provider"] == "litellm_proxy"
     assert decision["fell_back"] is False
