@@ -1053,3 +1053,47 @@ def test_a_direct_provider_route_is_still_refused(monkeypatch, tmp_path):
         )
     assert "not a compelled path" in str(exc.value)
     assert "openrouter" in str(exc.value)
+
+
+def test_the_degraded_route_alert_names_the_running_edition(monkeypatch, tmp_path):
+    """`send_alert` passes the edition to `notify.make_doctor`, which uses it to
+    pick the notification target — so a hardcoded value sends a PM-edition alert
+    to the AM flow. The first version of `_alert_degraded_route` hardcoded
+    "am"."""
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    degraded_spec = ModelSpec(
+        "deepseek", "deepseek-v4-pro",
+        base_url="http://127.0.0.1:8972", api_key_env="DEEPSEEK_API_KEY",
+        max_tokens=4096,
+    )
+    monkeypatch.setattr(
+        "krepis.router.resolve_group_spec",
+        lambda group, **kw: (degraded_spec, {"route": "egress_proxy"}),
+    )
+
+    class _Served:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+
+        def complete_grounded(self, **kw):
+            return _grounded(
+                provider="deepseek", model="deepseek-v4-pro",
+                text="Welcome to Morning Signal. Evening edition on the degraded route.",
+                n_searches=4,
+            )
+
+    monkeypatch.setattr(claude, "LLMClient", _Served)
+
+    editions: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: editions.append(edition) or True,
+    )
+
+    cfg = _base_config(llm='{"provider": "litellm", "model": "high"}')
+    claude.generate_script(cfg, "2026-08-12", "pm")
+
+    assert editions == ["pm"], (
+        f"the degraded-route alert must name the running edition, got {editions!r}"
+    )

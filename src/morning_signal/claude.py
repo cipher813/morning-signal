@@ -521,6 +521,30 @@ def _is_client_error_status(exc: BaseException) -> bool:
     return status in _DEPLOYMENT_CLASS_STATUSES
 
 
+#: Key under which the running edition is stamped into the config dict so that
+#: spec resolution — which happens below the level that knows the edition — can
+#: label its alerts correctly. Leading underscore because it is an in-process
+#: annotation, never a configured value; nothing reads it from SSM or YAML.
+_EDITION_KEY = "_edition"
+
+
+def _alerting_edition(config: dict) -> str:
+    """The edition an alert raised during spec resolution belongs to.
+
+    `send_alert` passes this to `notify.make_doctor`, which uses it to pick the
+    notification target — so a wrong value sends a PM-edition alert to the AM
+    flow. The first version of `_alert_degraded_route` hardcoded ``"am"``,
+    which is the same defect this session spent its length fixing elsewhere: a
+    label that does not track the thing it names.
+
+    Falls back to ``"am"`` only when the caller genuinely has no edition —
+    `scripts/oss_bakeoff.py` resolves a spec outside any episode. That path has
+    no fallback chain of its own, so it fails loudly rather than relying on
+    this alert.
+    """
+    return str(config.get(_EDITION_KEY) or "am")
+
+
 def _alert_degraded_route(
     config: dict, group: str, route: str, spec: ModelSpec
 ) -> None:
@@ -552,7 +576,7 @@ def _alert_degraded_route(
     try:
         from morning_signal.watchdog import send_alert
 
-        send_alert(config, config.get("_edition", "am"), message)
+        send_alert(config, _alerting_edition(config), message)
     except Exception:  # noqa: BLE001 — alerting must never block publish
         log.warning(
             "DEGRADED ROUTE alert failed to send (continuing to publish)",
@@ -1377,6 +1401,11 @@ def generate_script(
     # decision log still records what was asked for.
     primary_spec = declared_llm_spec(config)
     unresolvable_exc: Exception | None = None
+    # Spec resolution can alert (a degraded route, model-router-policy §5.4)
+    # and sits below the level that knows which edition is running, so the
+    # edition is stamped here rather than threaded through two signatures that
+    # have no other use for it.
+    config[_EDITION_KEY] = edition
     try:
         primary_spec = resolve_llm_spec(config)
     except RouterGroupUnresolvable as exc:
