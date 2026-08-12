@@ -221,12 +221,16 @@ def test_canary_succeeds_when_key_comes_only_from_ssm(monkeypatch):
             # `llm` is REQUIRED on a MORNING_SIGNAL_USE_SSM=1 deployment as of
             # this branch: the call site fails closed rather than defaulting to
             # a hardcoded Anthropic model (model-router-policy). This test's
-            # subject is that the API key resolves from SSM and not from env —
-            # the missing `llm` key made its FIXTURE incomplete under the new
-            # contract, it did not make the assertion wrong.
-            "llm:\n"
-            "  provider: router\n"
-            "  model: med\n"
+            # subject is that the API key resolves from SSM and not from the
+            # process environment — the missing key made its FIXTURE incomplete
+            # under the new contract; it did not make the assertion wrong.
+            #
+            # The value is a JSON STRING, not a nested YAML mapping.
+            # `declared_llm_spec` does `raw = str(configured)` then parses raw
+            # as JSON, so a YAML mapping arrives as a single-quoted Python repr
+            # and fails with "Expecting property name enclosed in double
+            # quotes". Matches the form the error message itself prescribes.
+            "llm: '{\"provider\": \"router\", \"model\": \"med\"}'\n"
         ),
         Type="SecureString",
     )
