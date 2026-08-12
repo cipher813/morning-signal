@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the provided news context; (2) a backstop guard rejects any script
   containing unexecuted tool-call XML and raises, engaging the same
   fallback-tier cascade as any other hard-abort, rather than publishing it.
+- **The unconfigured-`llm` default no longer silently reaches for a
+  hardcoded Anthropic model on a Nous Ergon (`MORNING_SIGNAL_USE_SSM=1`)
+  deployment.** Production's SSM config always sets `llm`; reaching the
+  default with SSM mode active now raises `LLMConfigError` (a deploy
+  defect) instead of defaulting. Self-hosted installs (no SSM, no router)
+  are unaffected — they keep the pre-migration literal default, since
+  those installs have no registry to derive a route from.
 
 ## [0.2.2] — 2026-08-17
 
