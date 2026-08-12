@@ -96,7 +96,25 @@ dependencies = [
     # ExecStartPre runs `pip install -e .`, which leaves an
     # already-constraint-satisfying version alone; with the old `>=0.24.0` the
     # box sat on 0.24.2 indefinitely and never saw a newer krepis.
-    "krepis[anthropic,openai]>=0.36.0,<0.37.0",
+    #
+    # Raised 0.36 -> 0.48 on 2026-08-12. 0.36.0 addresses the router group by
+    # its BARE ALIAS, and LiteLLM stamps the requested model back onto the
+    # response, so `resp.model == "high"` on every healthy call and krepis'
+    # own `_resolve_group_served_model` refuses it — "the router response did
+    # not report a served model distinct from the group alias ... it is not a
+    # real model and carries no price card". Refusing to bill under an alias
+    # is correct; the fix is to stop addressing one. Two krepis releases carry
+    # the two halves:
+    #   0.40.0  the litellm_proxy route resolves to the QUALIFIED primary
+    #           deployment name, `{group}-{mid}` (alpha-engine-config-I6727)
+    #   0.41.1  a deployment-addressed call is not alias masquerade, so the
+    #           echoed qualified name resolves through the registry to a
+    #           billable upstream id (alpha-engine-config-I6543)
+    # Below 0.41.1 the primary cannot succeed on this route at all, which is
+    # how `scripts/oss_bakeoff.py` — the only caller here with no fallback —
+    # has exited 1 every Wednesday.
+    # Verified by running the full suite against 0.48.0 before raising.
+    "krepis[anthropic,openai]>=0.48.0,<0.49.0",
     "pydantic>=2.0",
     # Pydantic v2 cannot eval PEP 604 `str | None` field annotations under
     # Python 3.9 even with `from __future__ import annotations` (mirrors krepis).
