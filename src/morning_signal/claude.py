@@ -231,6 +231,38 @@ class RouterGroupUnresolvable(RuntimeError):
 #: deployable by the merge button alone.
 _ROUTER_GROUP_PROVIDERS = frozenset({"router", "litellm"})
 
+#: Routes this consumer may be served on — the COMPELLED PATHS.
+#:
+#: `litellm_proxy` is the authenticated router edge: the normal case, where the
+#: proxy walks the group's chain server-side.
+#:
+#: `egress_proxy` is what `model-router-policy` §5.2 requires a consumer to
+#: degrade to when the edge's health probe does not pass: a REGISTRY-DERIVED
+#: direct route, declared `reachable_from` this execution context. It is still
+#: the compelled path — the request traverses the DLP egress proxy, so R26
+#: holds — and it is not a provider this repo chose.
+#:
+#: MEASURED 2026-08-12 for group `high`, exec_context `ec2`, which is what this
+#: consumer resolves:
+#:
+#:   deepseek-v4-pro-max              route=egress_proxy  ec2  active
+#:   grok-4                           route=egress_proxy  ec2  active
+#:   qwen3-max                        route=openrouter         unavailable
+#:   deepseek-v4-pro-openrouter-max   route=openrouter         unavailable
+#:
+#: So the degraded rung on this box is the egress-proxy DeepSeek entry, not a
+#: direct provider. This check previously refused ANY route but `litellm_proxy`,
+#: written on the assumption that the next rung was direct OpenRouter — true in
+#: general, false here, and the cost of the assumption was that a healthy
+#: compelled fallback was unreachable while the consumer's own hardcoded chain
+#: (direct OpenRouter, then direct Anthropic) ran instead, on every episode from
+#: 2026-08-09 to 2026-08-12.
+#:
+#: Anything NOT in this set — `openrouter`, `anthropic`, a bare provider — is
+#: still refused: alpha-engine-config-I6367 forbids direct-OpenRouter linkage,
+#: and the Anthropic API budget is $0 by the 2026-07-17 ruling.
+_COMPELLED_ROUTES = frozenset({"litellm_proxy", "egress_proxy"})
+
 
 def _resolve_router_group(spec: ModelSpec, config: dict) -> ModelSpec:
     """Turn a router-group spec into one addressing the authenticated edge.
@@ -295,13 +327,29 @@ def _resolve_router_group(spec: ModelSpec, config: dict) -> ModelSpec:
     # "resolved to something callable". Without this check the migration would
     # land looking successful and quietly reproduce the exact behaviour it was
     # written to end.
-    if route.get("route") != "litellm_proxy":
+    resolved_route = route.get("route")
+    if resolved_route not in _COMPELLED_ROUTES:
         raise RouterGroupUnresolvable(
             f"router group {spec.model!r} resolved to route "
-            f"{route.get('route')!r} (provider={edge_spec.provider!r}), not the "
-            f"authenticated router edge — refusing to call a direct provider "
-            f"chosen by fallback (alpha-engine-config-I6367)"
+            f"{resolved_route!r} (provider={edge_spec.provider!r}), which is "
+            f"not a compelled path — refusing to call a direct provider chosen "
+            f"by fallback (alpha-engine-config-I6367). Compelled routes: "
+            f"{sorted(_COMPELLED_ROUTES)}"
         )
+
+    if resolved_route != "litellm_proxy":
+        # model-router-policy §5.4: every degraded-mode entry alerts, with the
+        # reason. Resolution SUCCEEDED here — the episode will ship — so
+        # nothing else on this path is going to say that the router edge was
+        # not the thing that served it.
+        log.warning(
+            "DEGRADED: router group %r resolved to route %r (provider=%r "
+            "model=%r) rather than the authenticated edge. The edge's health "
+            "probe did not pass; this is the registry-derived degraded route "
+            "(model-router-policy §5.2), which is still the compelled path.",
+            spec.model, resolved_route, edge_spec.provider, edge_spec.model,
+        )
+        _alert_degraded_route(config, spec.model, resolved_route, edge_spec)
 
     log.info(
         "router group %r resolved to provider=%r model=%r route=%r",
@@ -471,6 +519,45 @@ def _is_client_error_status(exc: BaseException) -> bool:
         m = _STATUS_IN_MESSAGE.search(str(exc))
         status = int(m.group(1)) if m else None
     return status in _DEPLOYMENT_CLASS_STATUSES
+
+
+def _alert_degraded_route(
+    config: dict, group: str, route: str, spec: ModelSpec
+) -> None:
+    """Fire an alert for an episode served off the authenticated router edge.
+
+    ``model-router-policy`` §5.4: *every degraded-mode entry alerts, with the
+    reason.* Resolution SUCCEEDED on this path — the episode ships — so without
+    this nothing says the edge was not what served it, and a router that has
+    been unreachable for a week looks exactly like one that is working.
+
+    Best-effort by construction, same contract as
+    :func:`_alert_degraded_coverage`: ``send_alert`` already no-ops when
+    notifications are off, and the whole call is guarded so an alerting bug can
+    never block the publish path. A send failure is logged at WARNING — a
+    recorded surface, not a silent swallow.
+    """
+    message = (
+        f"⚠️ morning-signal is running DEGRADED: router group {group!r} was "
+        f"served on route {route!r}, not the authenticated router edge.\n\n"
+        f"The edge's health probe did not pass, so krepis resolved the "
+        f"registry-derived degraded route (model-router-policy §5.2). That is "
+        f"still the compelled path — provider={spec.provider!r} "
+        f"model={spec.model!r} — so nothing has left DLP scanning, and the "
+        f"episode ships.\n\n"
+        f"Triage: check litellm-proxy.service and the nginx router edge on the "
+        f"dashboard box. This is not a per-episode fault; it will keep firing "
+        f"until the edge is healthy."
+    )
+    try:
+        from morning_signal.watchdog import send_alert
+
+        send_alert(config, config.get("_edition", "am"), message)
+    except Exception:  # noqa: BLE001 — alerting must never block publish
+        log.warning(
+            "DEGRADED ROUTE alert failed to send (continuing to publish)",
+            exc_info=True,
+        )
 
 
 def _is_deployment_class_failure(exc: BaseException) -> bool:
@@ -1307,6 +1394,23 @@ def generate_script(
     friendly_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%A, %B %-d, %Y")
     log.info(f"Generating {edition_label} script for {friendly_date}...")
 
+    # NOTE — this cascade still selects a PROVIDER, which `model-router-policy`
+    # §5.2 does not permit: it allows only a REGISTRY-DERIVED direct entry
+    # declared `reachable_from` this context, and `fallback_llm` is a hardcoded
+    # slug in SSM config, unchecked for reachability, chosen by this repo. §5.1
+    # also requires unavailability to be detected by HEALTH CHECK rather than by
+    # a real request failing, and this fires on any primary failure at all.
+    #
+    # Not changed here, deliberately. `_COMPELLED_ROUTES` above makes krepis'
+    # own §5.2 path reachable, so this cascade stops firing in the case that was
+    # actually happening — an edge-down degrade now resolves to the egress-proxy
+    # entry and never reaches this code. Retiring the cascade itself changes what
+    # happens when the compelled path is entirely gone (§5.3 says fail closed;
+    # today it publishes on a forbidden route), which is an availability change
+    # for a daily-published episode and belongs in its own reviewed change
+    # rather than riding along here.
+    #
+    # Tracked: alpha-engine-config-I6980.
     fallback_eligible = (
         primary_spec.provider != "anthropic"
         and not os.environ.get(LLM_ENV_VAR)

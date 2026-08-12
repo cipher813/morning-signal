@@ -961,3 +961,95 @@ def test_status_is_read_from_the_attribute_not_only_the_message():
 
     assert claude._is_client_error_status(_WithAttr("opaque, no status in text"))
     assert not claude._is_client_error_status(_WithAttrTransient("opaque"))
+
+
+def test_the_registry_derived_egress_proxy_degrade_is_ACCEPTED(monkeypatch, tmp_path):
+    """`model-router-policy` §5.2's degraded route is not a violation.
+
+    When the edge's health probe fails, krepis walks the group's chain to the
+    next registry entry `reachable_from` this context. MEASURED 2026-08-12 for
+    group `high` / exec_context `ec2`, that is the **egress-proxy** DeepSeek
+    entry — `deepseek-v4-pro-max`, `route=egress_proxy`, active — not a direct
+    provider. The two OpenRouter rungs below it are marked `unavailable`.
+
+    That route still traverses the DLP egress proxy, so R26 holds, and it was
+    chosen by the registry rather than by this repo, which is exactly what §5.2
+    requires. Refusing it (the prior behaviour: anything but `litellm_proxy`)
+    made the one legitimate degraded path unreachable, so the consumer's own
+    hardcoded cascade ran instead — direct OpenRouter, then direct Anthropic,
+    on every episode from 2026-08-09 to 2026-08-12.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    degraded_spec = ModelSpec(
+        "deepseek", "deepseek-v4-pro",
+        base_url="http://127.0.0.1:8972", api_key_env="DEEPSEEK_API_KEY",
+        max_tokens=4096,
+    )
+    monkeypatch.setattr(
+        "krepis.router.resolve_group_spec",
+        lambda group, **kw: (degraded_spec, {"route": "egress_proxy"}),
+    )
+
+    class _ServedOnTheDegradedRoute:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+            assert spec.base_url == "http://127.0.0.1:8972", (
+                f"the degraded route must be the one the registry named, "
+                f"got base_url={spec.base_url!r}"
+            )
+
+        def complete_grounded(self, **kw):
+            return _grounded(
+                provider="deepseek", model="deepseek-v4-pro",
+                text="Welcome to Morning Signal. Aired on the compelled degraded route.",
+                n_searches=4,
+            )
+
+    monkeypatch.setattr(claude, "LLMClient", _ServedOnTheDegradedRoute)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
+
+    cfg = _base_config(llm='{"provider": "litellm", "model": "high"}')
+    script = claude.generate_script(cfg, "2026-08-12", "am")
+
+    assert "compelled degraded route" in script, (
+        "the episode must ship on the registry-derived degraded route rather "
+        "than falling through to the consumer's own provider cascade"
+    )
+    # §5.4: every degraded-mode entry alerts, with the reason. Resolution
+    # SUCCEEDED here, so without this nothing says the edge was not what served
+    # it — a router unreachable for a week looks like one that is working.
+    assert len(sent) == 1, "a degraded-route episode must raise exactly one alert"
+    assert "DEGRADED" in sent[0]
+    assert "egress_proxy" in sent[0]
+
+
+def test_a_direct_provider_route_is_still_refused(monkeypatch, tmp_path):
+    """The boundary the change above must not have moved.
+
+    `egress_proxy` is compelled; `openrouter` is not. Widening to "any route
+    krepis returns" would have re-admitted the alpha-engine-config-I6367
+    linkage under a new name.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    direct_spec = ModelSpec(
+        "openrouter", "deepseek/deepseek-v4-pro",
+        api_key_env="OPENROUTER_API_KEY", max_tokens=4096,
+    )
+    monkeypatch.setattr(
+        "krepis.router.resolve_group_spec",
+        lambda group, **kw: (direct_spec, {"route": "openrouter"}),
+    )
+
+    with pytest.raises(claude.RouterGroupUnresolvable) as exc:
+        claude._resolve_router_group(
+            ModelSpec("router", "high", max_tokens=4096), _base_config()
+        )
+    assert "not a compelled path" in str(exc.value)
+    assert "openrouter" in str(exc.value)
