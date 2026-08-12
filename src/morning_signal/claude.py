@@ -436,6 +436,43 @@ def _alert_degraded_coverage(
         )
 
 
+#: 4xx statuses that mean THIS DEPLOYMENT'S REQUEST could never be served —
+#: its credential, its endpoint, or the model name it addressed. An allowlist
+#: rather than "4xx minus the transient ones", because the 4xx range also
+#: carries conditions that are about the provider ACCOUNT or its capacity
+#: rather than about how this deployment is wired:
+#:
+#:   402  insufficient credits — a billing condition; the fallback chain
+#:        exists for it, and this function's original contract names it
+#:        explicitly as something not to fire on
+#:   408  a timeout wearing a client-error number
+#:   429  the rate limiter doing its job; says nothing about whether the
+#:        request was well-formed
+#:
+#: Those stay absorbed. The ones below cannot come right on their own, because
+#: the next scheduled run sends exactly the same request.
+_DEPLOYMENT_CLASS_STATUSES = frozenset({400, 401, 403, 404, 405, 422})
+
+#: The OpenAI SDK's rendering of an upstream status, e.g.
+#: ``Error code: 400 - {'error': {...}}``. Parsed only as a FALLBACK for
+#: exceptions that were re-raised as a plain message and lost the attribute;
+#: the attribute below is the primary source.
+_STATUS_IN_MESSAGE = re.compile(r"\bError code:\s*(\d{3})\b")
+
+
+def _is_client_error_status(exc: BaseException) -> bool:
+    """True when *exc* carries a status meaning this deployment's request could
+    never be served — see :data:`_DEPLOYMENT_CLASS_STATUSES`.
+    """
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        # Some layers re-raise with the status only in the message. Reading it
+        # back is lossy, so it is a second source and never the only one.
+        m = _STATUS_IN_MESSAGE.search(str(exc))
+        status = int(m.group(1)) if m else None
+    return status in _DEPLOYMENT_CLASS_STATUSES
+
+
 def _is_deployment_class_failure(exc: BaseException) -> bool:
     """True when *exc* means the configured primary spec was never CALLABLE
     from this deployment, as opposed to having been called and failed.
@@ -457,6 +494,25 @@ def _is_deployment_class_failure(exc: BaseException) -> bool:
     fallback in question is direct-OpenRouter linkage, which
     alpha-engine-config-I6367 forbids. The silence, not the fallback, is
     what let it stand for six days.
+
+    RECURRED 2026-08-09 .. 2026-08-12 with a different exception type, which is
+    why the membership test below is no longer a list of two classes. The unit
+    declared this consumer's per-consumer router credential but not the URL of
+    the edge that understands it, so krepis addressed the router process on
+    loopback and the router — which has no database to resolve a virtual key
+    against — answered every call ``400 no_db_connection``. Four days, every
+    scheduled run, aired from a fallback, silent: a 400 is neither an
+    ``ImportError`` nor a ``RouterGroupUnresolvable``.
+
+    A 4xx from the primary is a statement about the REQUEST — its credential,
+    its endpoint, the model name it addressed — and the next run sends exactly
+    the same request. It cannot come right on its own, so absorbing it into
+    the fallback is the same mistake in a new costume. 5xx, timeouts and
+    transport errors stay absorbed: those are what a fallback chain is FOR,
+    and firing on them would page for a mechanism working as designed.
+    ``LLMConfigError`` joins for the same reason — krepis raises it when the
+    resolved spec and the router's answer are mutually inconsistent, which no
+    retry changes.
     """
     seen: set[int] = set()
     cursor: BaseException | None = exc
@@ -465,7 +521,9 @@ def _is_deployment_class_failure(exc: BaseException) -> bool:
         # ImportError covers ModuleNotFoundError; RouterGroupUnresolvable means
         # the configured group never produced a callable endpoint here, which
         # is the same category — nothing about the next run will differ.
-        if isinstance(cursor, (ImportError, RouterGroupUnresolvable)):
+        if isinstance(cursor, (ImportError, RouterGroupUnresolvable, LLMConfigError)):
+            return True
+        if _is_client_error_status(cursor):
             return True
         cursor = cursor.__cause__ or cursor.__context__
     return False

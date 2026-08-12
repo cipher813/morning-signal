@@ -848,3 +848,116 @@ def test_non_runtime_error_from_primary_engages_fallback(monkeypatch, tmp_path):
     decision = json.loads(_decision_path(tmp_path, "2026-08-02").read_text())
     assert decision["fell_back"] is True
     assert decision["used_provider"] == "anthropic"
+
+
+def test_a_400_from_the_router_primary_alerts(monkeypatch, tmp_path):
+    """The four-day silence of 2026-08-09 .. 2026-08-12.
+
+    `20-router.conf` declared this consumer's per-consumer router credential
+    but not the URL of the edge that understands it, so krepis addressed the
+    router process on loopback and the router — which has no database to
+    resolve a virtual key against — answered every call:
+
+        400 {"error":{"message":"No connected db.","type":"no_db_connection"}}
+
+    Every scheduled run aborted its configured primary on that 400 and aired
+    from a fallback. Nothing fired, because a 400 is neither an ``ImportError``
+    nor a ``RouterGroupUnresolvable`` — the only two classes
+    ``_is_deployment_class_failure`` recognised. The episode still ships; the
+    point is that somebody is told.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    class _APIStatusError(Exception):
+        """Stand-in for openai.APIStatusError."""
+
+    class _RouterRejects:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+
+        def complete_grounded(self, **kw):
+            if self.spec.provider == "openrouter":
+                raise _APIStatusError(
+                    "Error code: 400 - {'error': {'message': 'No connected db.', "
+                    "'type': 'no_db_connection', 'code': '400'}}"
+                )
+            return _grounded(
+                provider="anthropic", model="claude-haiku-4-5",
+                text="Welcome to Morning Signal. Aired on the fallback.",
+                n_searches=4,
+            )
+
+        def complete(self, **kw):
+            raise _APIStatusError("Error code: 400 - {'error': {'message': 'No connected db.'}}")
+
+    monkeypatch.setattr(claude, "LLMClient", _RouterRejects)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
+
+    script = claude.generate_script(_base_config(), "2026-08-09", "am")
+
+    assert "Aired on the fallback" in script
+    assert len(sent) == 1, (
+        "a primary rejected 400 by the router must alert — the next run sends "
+        "the same request and gets the same 400"
+    )
+    assert "never callable from this deployment" in sent[0]
+
+
+def test_a_402_still_does_not_alert(monkeypatch, tmp_path):
+    """The boundary the 400 case must not have moved.
+
+    402 is a billing condition on the provider ACCOUNT, not a statement that
+    this deployment is wired wrong, and `_is_deployment_class_failure`'s
+    original contract names it explicitly as something the fallback chain
+    exists for. Widening to "any 4xx" would have swept it in.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+
+    class _APIStatusError(Exception):
+        pass
+
+    class _FailThenAnthropic:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+
+        def complete_grounded(self, **kw):
+            if self.spec.provider == "openrouter":
+                raise _APIStatusError("Error code: 402 - insufficient credits")
+            return _grounded(
+                provider="anthropic", model="claude-haiku-4-5",
+                text="Welcome to Morning Signal. Rescued by cascade.",
+                n_searches=4,
+            )
+
+    monkeypatch.setattr(claude, "LLMClient", _FailThenAnthropic)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
+
+    claude.generate_script(_base_config(), "2026-08-09", "am")
+
+    assert sent == [], "a 402 is what the fallback chain is for"
+
+
+def test_status_is_read_from_the_attribute_not_only_the_message():
+    """Message parsing is a lossy SECOND source. An exception carrying the
+    status as an attribute — which the OpenAI SDK does — must be classified
+    without the string ever being read, or the classifier silently depends on
+    a rendering the SDK is free to change.
+    """
+    class _WithAttr(Exception):
+        status_code = 401
+
+    class _WithAttrTransient(Exception):
+        status_code = 429
+
+    assert claude._is_client_error_status(_WithAttr("opaque, no status in text"))
+    assert not claude._is_client_error_status(_WithAttrTransient("opaque"))
