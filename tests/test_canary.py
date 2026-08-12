@@ -218,6 +218,15 @@ def test_canary_succeeds_when_key_comes_only_from_ssm(monkeypatch):
             "claude_model: claude-sonnet-4-6\n"
             "max_tokens: 4096\n"
             "web_search_max_uses: 20\n"
+            # `llm` is REQUIRED on a MORNING_SIGNAL_USE_SSM=1 deployment as of
+            # this branch: the call site fails closed rather than defaulting to
+            # a hardcoded Anthropic model (model-router-policy). This test's
+            # subject is that the API key resolves from SSM and not from env —
+            # the missing `llm` key made its FIXTURE incomplete under the new
+            # contract, it did not make the assertion wrong.
+            "llm:\n"
+            "  provider: router\n"
+            "  model: med\n"
         ),
         Type="SecureString",
     )
