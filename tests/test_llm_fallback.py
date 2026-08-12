@@ -1,17 +1,28 @@
-"""Tests for the Kimi-primary / Anthropic-fallback cascade (config#1659).
+"""Tests for the primary / fallback cascade (config#1659, retired to a
+compelled-route-only shape by alpha-engine-config-I6980).
 
-When the primary ``llm`` spec is non-Anthropic (e.g. an OpenRouter
-open-weight model) and its own attempt (first pass + self-heal recovery)
-either hard-fails (min_web_searches floor) or silently produces no usable
-content — a real, live-verified failure mode for reasoning-capable
-OpenRouter models, 2026-07-06 — ``generate_script`` falls through to ONE
-fresh attempt on the Anthropic default rather than aborting outright.
+When the primary ``llm`` spec's own attempt (first pass + self-heal
+recovery) either hard-fails (content-grounding verification) or silently
+produces no usable content — a real, live-verified failure mode for
+reasoning-capable models, 2026-07-06 — ``generate_script`` falls through to
+ONE fresh attempt on the configured ``fallback_llm``. As of I6980,
+``fallback_llm`` MUST name a krepis router group (same shape as ``llm``) and
+is resolved through the identical ``_resolve_router_group`` path — it is no
+longer a hardcoded provider slug, and there is no longer a silent
+direct-Anthropic default when it is unset or a tier-3 forced-search
+last-resort when it also fails. A compound failure of both configured tiers
+now fails closed (`model-router-policy` §5.3) rather than getting a third
+attempt: no episode, one alert (:func:`claude._alert_fallback_exhausted`).
+
 Every call also writes a ``{date}-{edition}.llm_decision.json`` recording
 which model actually produced (or failed to produce) the script.
 
 Uses a duck-typed fake ``LLMClient`` (real krepis ``GroundedResult``/
 ``LLMUsage`` dataclasses, no real SDK/network) dispatched by provider, so
-each test scripts exactly what the primary vs. fallback calls return.
+each test scripts exactly what the primary vs. fallback calls return. The
+fallback's own ``krepis.router.resolve_group_spec`` call is mocked via
+:func:`_mock_group_resolver`/:func:`_compelled_edge` the same way the
+primary's already was.
 """
 
 from __future__ import annotations
@@ -20,7 +31,7 @@ import json
 
 import pytest
 from krepis.llm import GroundedResult, LLMUsage
-from krepis.llm_config import ModelSpec
+from krepis.llm_config import LLMConfigError, ModelSpec
 
 from morning_signal import claude
 
@@ -92,56 +103,43 @@ def _client_factory(plan):
     return _FakeClient
 
 
-def _client_factory_with_capture(plan):
-    """Like :func:`_client_factory` but also records ``(provider,
-    force_first)`` for every ``complete_grounded`` call, so a test can
-    assert a specific tier's call actually forced ``tool_choice`` rather
-    than just asking for a search in prose."""
-    from types import SimpleNamespace
+#: A ``fallback_llm`` router-group config value — as of alpha-engine-config
+#: I6980, `resolve_fallback_spec` requires this shape (same as `llm`) and
+#: raises when it is unset or names a bare provider. Group name is
+#: arbitrary; the resolution mock below is what decides what it resolves to.
+_FALLBACK_GROUP = "med"
+_FALLBACK_LLM_CONFIG = f'{{"provider": "router", "model": "{_FALLBACK_GROUP}"}}'
 
-    from krepis.llm_config import LLMConfigError
 
-    remaining = {k: list(v) for k, v in plan.items()}
-    calls = []
+def _compelled_edge(provider, model, *, route="litellm_proxy", **spec_kw):
+    """Build a ``(ModelSpec, route_dict)`` pair for a compelled route —
+    what ``krepis.router.resolve_group_spec`` returns on success. Used to
+    mock the fallback tier's own router-group resolution, same as the
+    primary's (``_resolve_router_group`` treats both identically)."""
+    spec_kw.setdefault("base_url", "https://router.nousergon.ai:8443")
+    spec_kw.setdefault("api_key_env", "ROUTER_CONSUMER_MORNINGSIGNAL")
+    spec_kw.setdefault("max_tokens", 4096)
+    return ModelSpec(provider, model, **spec_kw), {"route": route}
 
-    class _FakeClient:
-        def __init__(self, spec, **kw):
-            self.spec = spec
 
-        def complete_grounded(self, *, search, **kw):
-            calls.append((self.spec.provider, search.force_first))
-            if self.spec.provider not in ("anthropic", "openrouter"):
-                raise LLMConfigError(
-                    f"complete_grounded unsupported on {self.spec.provider}"
-                )
-            queue = remaining.get(self.spec.provider)
-            if not queue:
-                raise AssertionError(
-                    f"no more scripted responses for provider={self.spec.provider!r}"
-                )
-            return queue.pop(0)
+def _mock_group_resolver(monkeypatch, groups):
+    """Dispatch ``krepis.router.resolve_group_spec`` by group name.
 
-        def complete(self, **kw):
-            calls.append((self.spec.provider, None))
-            queue = remaining.get(self.spec.provider)
-            if not queue:
-                raise AssertionError(
-                    f"no more scripted complete() responses for "
-                    f"provider={self.spec.provider!r}"
-                )
-            gr = queue.pop(0)
-            if isinstance(gr, SimpleNamespace):
-                return gr
-            return SimpleNamespace(
-                text=gr.text,
-                model=gr.model,
-                provider=gr.provider,
-                usage=gr.usage,
-                raw_request=gr.raw_request,
-                raw_response=gr.raw_response,
-            )
+    ``groups`` maps group name -> either a ``(spec, route_dict)`` tuple (see
+    :func:`_compelled_edge`) or an exception instance to raise, so one test
+    can script the primary group and the fallback group independently.
+    """
 
-    return _FakeClient, calls
+    def _fake_resolve(group, **kw):
+        entry = groups.get(group)
+        if entry is None:
+            raise AssertionError(f"unscripted group resolution request: {group!r}")
+        if isinstance(entry, BaseException):
+            raise entry
+        spec, route = entry
+        return spec, route
+
+    monkeypatch.setattr("krepis.router.resolve_group_spec", _fake_resolve)
 
 
 def _base_config(**overrides):
@@ -174,6 +172,9 @@ def _decision_path(tmp_path, date_str="2026-07-06", edition="am"):
 
 def test_falls_back_when_primary_produces_empty_content(monkeypatch, tmp_path):
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    _mock_group_resolver(monkeypatch, {
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
     plan = {
         "openrouter": [
             _grounded(provider="openrouter", model="moonshotai/kimi-k2.6",
@@ -187,7 +188,9 @@ def test_falls_back_when_primary_produces_empty_content(monkeypatch, tmp_path):
     }
     monkeypatch.setattr(claude, "LLMClient", _client_factory(plan))
 
-    script = claude.generate_script(_base_config(), "2026-07-06", "am")
+    script = claude.generate_script(
+        _base_config(fallback_llm=_FALLBACK_LLM_CONFIG), "2026-07-06", "am"
+    )
 
     assert "Real content here" in script
 
@@ -201,6 +204,9 @@ def test_falls_back_when_primary_produces_empty_content(monkeypatch, tmp_path):
 
 def test_falls_back_when_primary_has_no_search_results(monkeypatch, tmp_path):
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    _mock_group_resolver(monkeypatch, {
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
     plan = {
         "openrouter": [
             _grounded(provider="openrouter", model="moonshotai/kimi-k2.6",
@@ -215,7 +221,9 @@ def test_falls_back_when_primary_has_no_search_results(monkeypatch, tmp_path):
     }
     monkeypatch.setattr(claude, "LLMClient", _client_factory(plan))
 
-    script = claude.generate_script(_base_config(), "2026-07-06", "am")
+    script = claude.generate_script(
+        _base_config(fallback_llm=_FALLBACK_LLM_CONFIG), "2026-07-06", "am"
+    )
 
     assert "Fallback content" in script
     decision = json.loads(_decision_path(tmp_path).read_text())
@@ -224,7 +232,14 @@ def test_falls_back_when_primary_has_no_search_results(monkeypatch, tmp_path):
 
 
 def test_hard_aborts_when_both_primary_and_fallback_fail(monkeypatch, tmp_path):
+    """model-router-policy §5.3: a total compelled-path loss (here, both
+    configured tiers producing no usable content) fails closed — one
+    alert, no episode. Closes-when criterion #3 of alpha-engine-config
+    I6980."""
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    _mock_group_resolver(monkeypatch, {
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
     plan = {
         "openrouter": [
             _grounded(provider="openrouter", model="moonshotai/kimi-k2.6",
@@ -237,8 +252,16 @@ def test_hard_aborts_when_both_primary_and_fallback_fail(monkeypatch, tmp_path):
     }
     monkeypatch.setattr(claude, "LLMClient", _client_factory(plan))
 
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
+
     with pytest.raises(SystemExit):
-        claude.generate_script(_base_config(), "2026-07-06", "am")
+        claude.generate_script(
+            _base_config(fallback_llm=_FALLBACK_LLM_CONFIG), "2026-07-06", "am"
+        )
 
     # The decision log still records the (failed) attempt — worth knowing
     # both models failed today, not just silence.
@@ -246,74 +269,86 @@ def test_hard_aborts_when_both_primary_and_fallback_fail(monkeypatch, tmp_path):
     assert decision["fell_back"] is True
     assert decision["fallback_outcome"]["script_chars"] == 0
 
+    assert len(sent) == 1, "a fully-exhausted cascade must fail closed with exactly one alert"
+    assert "NO EPISODE" in sent[0]
 
-# ── Tier 3: forced-search Anthropic last-resort (morning-signal-I118,
-# 2026-07-16) ────────────────────────────────────────────────────────────
+
+# ── Fail-closed contract (alpha-engine-config-I6980) ─────────────────────
 #
-# 2026-07-16 production incident: primary (Kimi) leaked a raw tool-call
-# token, correctly triggered the configured (non-Anthropic) fallback
-# (DeepSeek v4-flash) — which completed cleanly but never invoked
-# web_search at all, tripping the zero-citations grounding guard with no
-# further tier to catch it. These tests exercise the tier-3 rescue added
-# to close that gap.
+# The tier-3 forced-search Anthropic last-resort (morning-signal-I118,
+# 2026-07-16) is RETIRED: its whole value was a deterministic ``tool_choice``
+# force, an Anthropic-only transport capability, which coupled a
+# grounding-quality guarantee to a direct-provider call — exactly the
+# pattern this issue exists to end (direct-Anthropic is also a $0 budget
+# line, 2026-07-17 ruling). These tests exercise what replaces it: a
+# compound failure of both configured tiers now fails closed
+# (model-router-policy §5.3) rather than getting a third attempt.
 
 
-def test_tier3_forced_search_rescues_after_configured_fallback_also_fails(
-    monkeypatch, tmp_path
-):
-    """Mirrors the 2026-07-16 failure exactly: primary produces no usable
-    content, the CONFIGURED (non-Anthropic) fallback hard-fails its own
-    grounding check (zero citations) — tier 3's forced-search Anthropic
-    last-resort rescues the episode instead of aborting outright."""
+def test_fallback_llm_naming_a_bare_provider_is_refused(monkeypatch, tmp_path):
+    """model-router-policy §5.2 permits only a registry-derived route; a
+    bare provider slug in ``fallback_llm`` is refused OUTRIGHT — it must
+    never reach an ``LLMClient`` call at all, matching the 2026-08-09..12
+    incident where this exact shape served direct OpenRouter on every
+    episode. Deliverable #1 of alpha-engine-config-I6980."""
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
     plan = {
         "openrouter": [
             _grounded(provider="openrouter", model="moonshotai/kimi-k2.6",
                       text="", n_searches=10),
-            _grounded(provider="openrouter", model="deepseek/deepseek-v4-flash",
-                      text="ungrounded text", n_searches=0, citations=[]),
-        ],
-        "anthropic": [
-            _grounded(provider="anthropic", model="claude-haiku-4-5",
-                      text="Welcome to Morning Signal. Tier 3 content.",
-                      n_searches=4),
         ],
     }
-    FakeClient, calls = _client_factory_with_capture(plan)
-    monkeypatch.setattr(claude, "LLMClient", FakeClient)
+
+    class _MustNeverBeCalledForFallback:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+
+        def complete_grounded(self, **kw):
+            if self.spec.provider != "openrouter":
+                raise AssertionError(
+                    f"a bare-provider fallback_llm must never reach "
+                    f"LLMClient, got provider={self.spec.provider!r}"
+                )
+            return plan["openrouter"].pop(0)
+
+    monkeypatch.setattr(claude, "LLMClient", _MustNeverBeCalledForFallback)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
 
     config = _base_config(fallback_llm=(
         '{"provider": "openrouter", "model": "deepseek/deepseek-v4-flash", '
         '"reasoning": {"exclude": true}}'
     ))
-    script = claude.generate_script(config, "2026-07-06", "am")
 
-    assert "Tier 3 content" in script
-    decision = json.loads(_decision_path(tmp_path).read_text())
-    assert decision["used_provider"] == "anthropic"
-    assert decision["used_model"] == "claude-haiku-4-5"
-    assert decision["fell_back"] is True
+    # resolve_fallback_spec raises synchronously — no queued response is ever
+    # consumed, so the exception is an LLMConfigError, not the "ran and
+    # produced nothing" SystemExit path.
+    with pytest.raises(LLMConfigError, match="bare provider"):
+        claude.generate_script(config, "2026-07-06", "am")
 
-    # The whole point of the fix: tier 3's call must have forced search,
-    # not merely asked for one in prose (which is what tier 2 effectively
-    # did and still produced zero citations).
-    anthropic_calls = [force for provider, force in calls if provider == "anthropic"]
-    assert anthropic_calls == [True]
+    assert len(sent) == 1
+    assert "NO EPISODE" in sent[0]
 
 
-def test_hard_aborts_when_forced_search_tier3_also_gets_zero_citations(
+def test_hard_aborts_when_primary_and_fallback_both_fail_grounding(
     monkeypatch, tmp_path
 ):
-    """Even the forced-search last resort can fail its own grounding check
-    (e.g. a genuine Anthropic outage) — must still hard-abort. There is
-    nowhere further to fall back to."""
+    """Both configured tiers fail their own content-grounding check (zero
+    citations) — must hard-abort. There is no tier 3 to catch this
+    anymore; the RuntimeError from the fallback attempt propagates
+    directly, and it is the ONE alert the fail-closed path fires."""
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    _mock_group_resolver(monkeypatch, {
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
     plan = {
         "openrouter": [
             _grounded(provider="openrouter", model="moonshotai/kimi-k2.6",
                       text="", n_searches=10),
-            _grounded(provider="openrouter", model="deepseek/deepseek-v4-flash",
-                      text="ungrounded text", n_searches=0, citations=[]),
         ],
         "anthropic": [
             _grounded(provider="anthropic", model="claude-haiku-4-5",
@@ -322,43 +357,23 @@ def test_hard_aborts_when_forced_search_tier3_also_gets_zero_citations(
     }
     monkeypatch.setattr(claude, "LLMClient", _client_factory(plan))
 
-    config = _base_config(fallback_llm=(
-        '{"provider": "openrouter", "model": "deepseek/deepseek-v4-flash", '
-        '"reasoning": {"exclude": true}}'
-    ))
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "morning_signal.watchdog.send_alert",
+        lambda config, edition, message: sent.append(message) or True,
+    )
 
     with pytest.raises(RuntimeError, match="zero citations"):
-        claude.generate_script(config, "2026-07-06", "am")
+        claude.generate_script(
+            _base_config(fallback_llm=_FALLBACK_LLM_CONFIG), "2026-07-06", "am"
+        )
 
     # Exception propagates before the decision log would be written, same
-    # as the anthropic-only-config hard-abort case.
+    # as the anthropic-only-config hard-abort case — but the fail-closed
+    # alert still fires (it is what tells a human the episode didn't ship).
     assert not _decision_path(tmp_path).exists()
-
-
-def test_tier3_skipped_when_configured_fallback_is_already_anthropic(monkeypatch, tmp_path):
-    """When no ``fallback_llm`` is configured, tier 2 already IS the
-    Anthropic default — tier 3 must not fire a second, redundant Anthropic
-    call. Unchanged pre-existing 2-tier behavior."""
-    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
-    plan = {
-        "openrouter": [
-            _grounded(provider="openrouter", model="moonshotai/kimi-k2.6",
-                      text="", n_searches=10),
-        ],
-        "anthropic": [
-            _grounded(provider="anthropic", model="claude-haiku-4-5",
-                      text="", n_searches=5),
-        ],
-    }
-    FakeClient, calls = _client_factory_with_capture(plan)
-    monkeypatch.setattr(claude, "LLMClient", FakeClient)
-
-    with pytest.raises(SystemExit):
-        claude.generate_script(_base_config(), "2026-07-06", "am")
-
-    # Exactly one anthropic call (tier 2), not two — no redundant tier 3.
-    anthropic_calls = [p for p, _ in calls if p == "anthropic"]
-    assert len(anthropic_calls) == 1
+    assert len(sent) == 1
+    assert "NO EPISODE" in sent[0]
 
 
 def test_no_fallback_when_primary_is_already_anthropic(monkeypatch, tmp_path):
@@ -574,10 +589,10 @@ def test_unresolvable_router_group_falls_back_and_alerts(monkeypatch, tmp_path):
     """
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
 
-    def _fake_resolve(group, **kw):
-        raise RuntimeError("no reachable entry for group 'high'")
-
-    monkeypatch.setattr("krepis.router.resolve_group_spec", _fake_resolve)
+    _mock_group_resolver(monkeypatch, {
+        "high": RuntimeError("no reachable entry for group 'high'"),
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
 
     class _AnthropicOnly:
         def __init__(self, spec, **kw):
@@ -603,7 +618,10 @@ def test_unresolvable_router_group_falls_back_and_alerts(monkeypatch, tmp_path):
     )
 
     script = claude.generate_script(
-        _base_config(llm='{"provider": "litellm", "model": "high"}'),
+        _base_config(
+            llm='{"provider": "litellm", "model": "high"}',
+            fallback_llm=_FALLBACK_LLM_CONFIG,
+        ),
         "2026-08-08", "am",
     )
 
@@ -638,10 +656,10 @@ def test_group_resolving_to_a_direct_provider_is_refused(monkeypatch, tmp_path):
         "openrouter", "deepseek/deepseek-v4-pro",
         api_key_env="OPENROUTER_API_KEY", max_tokens=4096,
     )
-    monkeypatch.setattr(
-        "krepis.router.resolve_group_spec",
-        lambda group, **kw: (direct_spec, {"route": "direct"}),
-    )
+    _mock_group_resolver(monkeypatch, {
+        "high": (direct_spec, {"route": "direct"}),
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
 
     class _AnthropicOnly:
         def __init__(self, spec, **kw):
@@ -666,7 +684,10 @@ def test_group_resolving_to_a_direct_provider_is_refused(monkeypatch, tmp_path):
     )
 
     script = claude.generate_script(
-        _base_config(llm='{"provider": "litellm", "model": "high"}'),
+        _base_config(
+            llm='{"provider": "litellm", "model": "high"}',
+            fallback_llm=_FALLBACK_LLM_CONFIG,
+        ),
         "2026-08-08", "am",
     )
 
@@ -743,6 +764,9 @@ def test_primary_unusable_in_this_deployment_alerts(monkeypatch, tmp_path):
     ``test_unresolvable_router_group_falls_back_and_alerts``.
     """
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    _mock_group_resolver(monkeypatch, {
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
 
     class _PrimaryNotInstalled:
         def __init__(self, spec, **kw):
@@ -768,7 +792,9 @@ def test_primary_unusable_in_this_deployment_alerts(monkeypatch, tmp_path):
         lambda config, edition, message: sent.append(message) or True,
     )
 
-    script = claude.generate_script(_base_config(), "2026-08-08", "am")
+    script = claude.generate_script(
+        _base_config(fallback_llm=_FALLBACK_LLM_CONFIG), "2026-08-08", "am"
+    )
 
     assert "Aired on the fallback" in script
     assert len(sent) == 1, "a permanently-unusable primary must raise exactly one alert"
@@ -782,6 +808,9 @@ def test_ordinary_provider_failure_does_not_alert(monkeypatch, tmp_path):
     mechanism working as designed, which is how an alert stops being read.
     """
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    _mock_group_resolver(monkeypatch, {
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
 
     class _APIStatusError(Exception):
         pass
@@ -807,7 +836,9 @@ def test_ordinary_provider_failure_does_not_alert(monkeypatch, tmp_path):
         lambda config, edition, message: sent.append(message) or True,
     )
 
-    claude.generate_script(_base_config(), "2026-08-08", "am")
+    claude.generate_script(
+        _base_config(fallback_llm=_FALLBACK_LLM_CONFIG), "2026-08-08", "am"
+    )
 
     assert sent == []
 
@@ -818,6 +849,9 @@ def test_non_runtime_error_from_primary_engages_fallback(monkeypatch, tmp_path):
     could engage. Cascade must catch Exception, not just RuntimeError.
     """
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    _mock_group_resolver(monkeypatch, {
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
 
     class _APIStatusError(Exception):
         """Stand-in for openai.APIStatusError — not a RuntimeError subclass."""
@@ -842,7 +876,9 @@ def test_non_runtime_error_from_primary_engages_fallback(monkeypatch, tmp_path):
 
     monkeypatch.setattr(claude, "LLMClient", _FailThenAnthropic)
 
-    script = claude.generate_script(_base_config(), "2026-08-02", "am")
+    script = claude.generate_script(
+        _base_config(fallback_llm=_FALLBACK_LLM_CONFIG), "2026-08-02", "am"
+    )
 
     assert "Rescued by cascade" in script
     decision = json.loads(_decision_path(tmp_path, "2026-08-02").read_text())
@@ -867,6 +903,9 @@ def test_a_400_from_the_router_primary_alerts(monkeypatch, tmp_path):
     point is that somebody is told.
     """
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    _mock_group_resolver(monkeypatch, {
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
 
     class _APIStatusError(Exception):
         """Stand-in for openai.APIStatusError."""
@@ -898,7 +937,9 @@ def test_a_400_from_the_router_primary_alerts(monkeypatch, tmp_path):
         lambda config, edition, message: sent.append(message) or True,
     )
 
-    script = claude.generate_script(_base_config(), "2026-08-09", "am")
+    script = claude.generate_script(
+        _base_config(fallback_llm=_FALLBACK_LLM_CONFIG), "2026-08-09", "am"
+    )
 
     assert "Aired on the fallback" in script
     assert len(sent) == 1, (
@@ -917,6 +958,9 @@ def test_a_402_still_does_not_alert(monkeypatch, tmp_path):
     exists for. Widening to "any 4xx" would have swept it in.
     """
     monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    _mock_group_resolver(monkeypatch, {
+        _FALLBACK_GROUP: _compelled_edge("anthropic", "claude-haiku-4-5"),
+    })
 
     class _APIStatusError(Exception):
         pass
@@ -942,7 +986,9 @@ def test_a_402_still_does_not_alert(monkeypatch, tmp_path):
         lambda config, edition, message: sent.append(message) or True,
     )
 
-    claude.generate_script(_base_config(), "2026-08-09", "am")
+    claude.generate_script(
+        _base_config(fallback_llm=_FALLBACK_LLM_CONFIG), "2026-08-09", "am"
+    )
 
     assert sent == [], "a 402 is what the fallback chain is for"
 
