@@ -190,15 +190,46 @@ def _anthropic_default_spec(config: dict) -> ModelSpec:
 def resolve_fallback_spec(config: dict) -> ModelSpec:
     """The fallback ModelSpec used when the primary spec fails.
 
-    Reads config ``fallback_llm`` (same format as ``llm`` — a JSON string
-    or dict with provider/model/reasoning keys). Falls back to
-    ``_anthropic_default_spec`` when unset, preserving pre-migration
-    behavior for configs that only set ``claude_model``.
+    Reads config ``fallback_llm`` (same format as ``llm``) and resolves it
+    through ``_resolve_router_group`` — the SAME path the primary spec goes
+    through. `model-router-policy` §5.2 permits only a registry-derived
+    route reachable from this execution context; it does not distinguish
+    "primary" from "fallback" tiers, so neither may pick a provider by name.
+
+    Previously this called ``parse_model_spec`` directly on a bare provider
+    slug and returned it uncontested — that is exactly how the cascade
+    served direct OpenRouter and, when that also failed, a silent
+    Anthropic default on every episode 2026-08-09..12
+    (alpha-engine-config-I6980). There is no direct-provider default left:
+    a resolution failure here must propagate so the caller fails closed
+    (§5.3), not land on a route nobody chose.
+
+    :raises LLMConfigError: ``fallback_llm`` is unset, or names a bare
+        provider rather than a router group.
+    :raises RouterGroupUnresolvable: the named group did not resolve to a
+        compelled route (:data:`_COMPELLED_ROUTES`) from this deployment.
     """
     configured = config.get("fallback_llm")
-    if configured:
-        return parse_model_spec(str(configured), source="config 'fallback_llm'")
-    return _anthropic_default_spec(config)
+    if not configured:
+        raise LLMConfigError(
+            "config 'fallback_llm' is unset. model-router-policy §5.3 "
+            "forbids defaulting an unconfigured fallback to a direct "
+            "provider — set it to a krepis router group, e.g. "
+            '{"provider": "router", "model": "med"} or the legacy spelling '
+            '"litellm:med".'
+        )
+    group = _router_group_from_raw(str(configured))
+    if group is None:
+        raise LLMConfigError(
+            f"config 'fallback_llm' = {configured!r} names a bare provider, "
+            f"not a krepis router group. model-router-policy §5.2 permits "
+            f"only a registry-derived route this repo does not choose by "
+            f"name — set 'fallback_llm' to a router group (provider "
+            f"'router' or 'litellm', e.g. {{\"provider\": \"router\", "
+            f"\"model\": \"med\"}})."
+        )
+    declared = ModelSpec("router", group, max_tokens=config.get("max_tokens", 4096))
+    return _resolve_router_group(declared, config)
 
 
 class RouterGroupUnresolvable(RuntimeError):
@@ -676,6 +707,55 @@ def _alert_primary_never_usable(
         )
 
 
+def _alert_fallback_exhausted(
+    config: dict,
+    edition: str,
+    edition_label: str,
+    friendly_date: str,
+    primary_spec: ModelSpec,
+    exc: BaseException | None,
+) -> None:
+    """Alert that NO compelled route produced a script — no episode today.
+
+    `model-router-policy` §5.3: when no registry-derived route both resolves
+    and serves the caller's wire format, the consumer fails closed. Not
+    publishing is the CORRECT outcome here — publishing on a route outside
+    :data:`_COMPELLED_ROUTES` is the forbidden alternative this issue exists
+    to end. But a fail-closed episode with no alert is indistinguishable
+    from a cron job that silently stopped firing, so this is what tells a
+    human the difference between "the podcast is down" and "nothing ran".
+
+    Unlike :func:`_alert_primary_never_usable` and
+    :func:`_alert_degraded_route`, the episode does NOT ship after this — it
+    fires exactly once, from the branch that is about to raise. Same
+    best-effort posture as the other alerts: send failure is logged at
+    WARNING, never swallowed, and never allowed to mask the real exception.
+    """
+    message = (
+        f"🚨 morning-signal {edition_label} edition for {friendly_date}: "
+        f"NO EPISODE — every compelled route was exhausted.\n\n"
+        f"Configured primary: provider={primary_spec.provider!r} "
+        f"model={primary_spec.model!r}\n"
+        f"Last error: {exc}\n\n"
+        f"model-router-policy §5.3: failing closed here is correct — the "
+        f"forbidden alternative was publishing on a direct provider nobody "
+        f"chose. This means the authenticated router edge AND its "
+        f"registry-derived degraded route (§5.2) are both unavailable from "
+        f"this deployment. Triage: litellm-proxy.service and the egress "
+        f"proxy on the dashboard box; this will keep firing, with no "
+        f"episode, until one of them is healthy again."
+    )
+    try:
+        from morning_signal.watchdog import send_alert
+
+        send_alert(config, edition, message)
+    except Exception:  # noqa: BLE001 — alerting must never mask the raise
+        log.warning(
+            "FAIL-CLOSED alert failed to send (no episode either way)",
+            exc_info=True,
+        )
+
+
 def is_non_trading_day(date_str: str) -> bool:
     """True for Sat/Sun + NYSE holidays. Drives prompt + PM-skip selection."""
     return not is_trading_day(datetime.strptime(date_str, "%Y-%m-%d").date())
@@ -1058,20 +1138,22 @@ def _attempt_episode(
     content-grounding verification and ``required_search_topics_fatal`` — same
     as always. :func:`generate_script` decides what a raise (or an empty-
     but-non-raising return) means: for a provider with no fallback
-    configured, it propagates exactly as before; for a primary spec that
-    HAS a fallback (config#1659: default to an OSS model, fall back to
-    Anthropic on exhaustion), it triggers a second attempt on the fallback
+    configured, it propagates exactly as before; for a primary spec that HAS
+    a fallback (config#1659, `fallback_llm` — a router group as of
+    alpha-engine-config-I6980), it triggers a second attempt on the fallback
     spec instead.
 
     ``force_search=True`` deterministically forces the FIRST pass's
     ``web_search`` call via ``tool_choice`` (see ``_invoke_and_record``) —
-    used by :func:`generate_script`'s tier-3 last-resort attempt so the
-    content-grounding check below cannot fail with zero citations the way
-    a discretionary (unforced) call can (2026-07-16: a fallback model
-    completed cleanly but never invoked the tool). Only the anthropic
-    transport supports the force; callers must not pass ``force_search=True``
-    for an OpenRouter spec (``_invoke_and_record`` raises ``LLMConfigError``
-    there rather than silently degrading).
+    used by the per-segment self-heal recovery pass below so a dropped
+    required-topic segment cannot fail with zero citations the way a
+    discretionary (unforced) call can. Only the anthropic transport supports
+    the force; callers must not pass ``force_search=True`` for an OpenRouter
+    spec (``_invoke_and_record`` raises ``LLMConfigError`` there rather than
+    silently degrading). ``generate_script`` no longer has a tier-3
+    forced-search last resort of its own — retired with the direct-Anthropic
+    cascade (alpha-engine-config-I6980); the force here is scoped to this
+    recovery pass only.
     """
     result, n_searches = _invoke_and_record(
         llm_client, config, prompt_text, user_content, date_str, edition,
@@ -1369,31 +1451,42 @@ def generate_script(
     ``max_uses`` on ``web_search`` caps server-tool fees in the runaway
     case; 20 is above the empirical typical (~15).
 
-    Provider fallback (config#1659, extended morning-signal-I118): the
-    ``llm`` config knob can point at a non-Anthropic primary (e.g. an
-    OpenRouter open-weight model). If that primary's OWN attempt hard-fails
-    (content-grounding verification) or silently produces no usable content
-    — a real, live-verified failure mode for reasoning-capable OpenRouter
-    models, 2026-07-06 — this falls through to ``resolve_fallback_spec``
-    (tier 2, config ``fallback_llm``, itself defaulting to the Anthropic
-    default when unset). If tier 2 is ALSO non-Anthropic and ALSO fails,
-    tier 3 is ONE forced-search attempt (``force_search=True``) on
-    :func:`_anthropic_default_spec` — added 2026-07-16 after a compound
-    failure (primary tool-call leak + fallback silently skipping
-    web_search) lost an episode with no further tier to catch it. Tier 3's
-    forced ``tool_choice`` makes the zero-citations failure mode that hit
-    tier 2 structurally impossible on this pass (anthropic-only capability;
-    OpenRouter cannot force its search tool at all). This tier only ever
-    fires on a compound failure of both configured tiers, so it doesn't
-    reopen the routine-cost tradeoff #110 made — it bounds the downside of
-    that tradeoff instead of removing it.
+    Provider fallback (config#1659, extended morning-signal-I118, retired to
+    a compelled-route-only shape by alpha-engine-config-I6980): the ``llm``
+    config knob can point at a router group (e.g. group ``high``). If the
+    primary's OWN attempt hard-fails (content-grounding verification) or
+    silently produces no usable content — a real, live-verified failure
+    mode for reasoning-capable open-weight models, 2026-07-06 — this falls
+    through to ``resolve_fallback_spec`` (config ``fallback_llm``), which
+    MUST also name a router group and is resolved through the SAME
+    ``_resolve_router_group`` path as the primary. `model-router-policy`
+    §5.2 does not grant a fallback tier any more latitude than the primary
+    to pick a provider by name, so neither one gets a direct-provider
+    default: resolution failure here propagates and the episode fails
+    closed (§5.3) rather than landing on a route nobody chose.
+
+    There used to be a tier 3 — ONE forced-search attempt
+    (``force_search=True``) on a hardcoded direct-Anthropic spec, added
+    2026-07-16 after a compound failure lost an episode with no further
+    tier to catch it. Retired here rather than converted to a router group:
+    its entire value was the deterministic ``tool_choice`` force, which is
+    an Anthropic-only transport capability (`_invoke_and_record` degrades it
+    to best-effort or a no-op on every other transport) — coupling a
+    grounding-quality guarantee to a specific provider is exactly the
+    pattern this issue exists to end, and direct-Anthropic is a $0 budget
+    line regardless (2026-07-17 ruling). A compound failure of both
+    configured tiers now fails closed instead of getting a third attempt;
+    :func:`_alert_fallback_exhausted` is what tells a human the episode
+    didn't ship.
+
     Skipped when ``MORNING_SIGNAL_LLM`` pins an exact spec (the escape
     hatch means "run exactly this," not "with a hidden fallback"), and
-    skipped when the primary IS ALREADY the anthropic spec (falling back
-    to the same model fixes nothing and doubles cost). Tier 3's own
-    hard-abort propagates unchanged — there is nowhere further to fall
-    back to. Either way, :func:`_record_llm_decision`
-    logs which model actually produced (or failed to produce) the script.
+    skipped when the primary IS ALREADY the anthropic spec (falling back to
+    the same model fixes nothing and doubles cost — and a bare-anthropic
+    primary can only happen via that same pinned escape hatch or the OSS
+    self-host legacy default, neither of which this issue governs).
+    :func:`_record_llm_decision` logs which model actually produced (or
+    failed to produce) the script either way.
     """
     # A router group that will not resolve is a primary failure BEFORE any
     # call is made, not a reason to abort the episode: the configured fallback
@@ -1423,23 +1516,17 @@ def generate_script(
     friendly_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%A, %B %-d, %Y")
     log.info(f"Generating {edition_label} script for {friendly_date}...")
 
-    # NOTE — this cascade still selects a PROVIDER, which `model-router-policy`
-    # §5.2 does not permit: it allows only a REGISTRY-DERIVED direct entry
-    # declared `reachable_from` this context, and `fallback_llm` is a hardcoded
-    # slug in SSM config, unchecked for reachability, chosen by this repo. §5.1
-    # also requires unavailability to be detected by HEALTH CHECK rather than by
-    # a real request failing, and this fires on any primary failure at all.
-    #
-    # Not changed here, deliberately. `_COMPELLED_ROUTES` above makes krepis'
-    # own §5.2 path reachable, so this cascade stops firing in the case that was
-    # actually happening — an edge-down degrade now resolves to the egress-proxy
-    # entry and never reaches this code. Retiring the cascade itself changes what
-    # happens when the compelled path is entirely gone (§5.3 says fail closed;
-    # today it publishes on a forbidden route), which is an availability change
-    # for a daily-published episode and belongs in its own reviewed change
-    # rather than riding along here.
-    #
-    # Tracked: alpha-engine-config-I6980.
+    # `_COMPELLED_ROUTES` (above) makes krepis' own §5.2 degraded path
+    # reachable, so the primary itself no longer falls through to a direct
+    # provider on an edge-down degrade. This fallback tier is what remains
+    # for a primary that resolved fine but whose ATTEMPT failed (content-
+    # grounding verification, or a provider producing no usable content) —
+    # `resolve_fallback_spec` now resolves `fallback_llm` through the same
+    # router-group path (alpha-engine-config-I6980), so a total loss of the
+    # router edge AND its registry-derived degraded route fails closed
+    # (§5.3) via `_alert_fallback_exhausted` below, instead of publishing on
+    # a route this repo chose. A total compelled-path loss means no episode
+    # — that is the correct, intended outcome of this change, not a gap.
     fallback_eligible = (
         primary_spec.provider != "anthropic"
         and not os.environ.get(LLM_ENV_VAR)
@@ -1486,7 +1573,6 @@ def generate_script(
                 f"its own retries — falling back to the fallback spec."
             )
         primary_failed_exc = None
-        fallback_spec = _anthropic_default_spec(config)
         try:
             fallback_spec = resolve_fallback_spec(config)
             fallback_client = LLMClient(fallback_spec, callsite_id="morning-signal-episode-fallback", max_retries=5)
@@ -1501,50 +1587,27 @@ def generate_script(
             fallback_outcome = None
             primary_failed_exc = exc
 
-        # If the configured fallback is non-Anthropic and also failed, tier 3
-        # is ONE forced-search attempt on the Anthropic default (morning-
-        # signal-I118, 2026-07-16). It only ever runs on a compound failure of
-        # BOTH configured tiers — a rare event, not the routine per-run cost
-        # #110 was optimizing away — so it doesn't reopen that cost tradeoff.
-        # force_search=True deterministically forces the web_search tool_choice
-        # (anthropic-only capability, verified live 2026-06-29): unlike tiers
-        # 1-2, this pass CANNOT complete with zero citations, which is exactly
-        # the failure mode that lost the 2026-07-16 episode (fallback model
-        # completed cleanly but chose not to invoke web_search at all).
-        if not script and fallback_spec.provider != "anthropic":
+        if not script:
+            # Both compelled tiers are now exhausted and there is no direct-
+            # provider tier 3 left to try (alpha-engine-config-I6980). §5.3:
+            # fail closed rather than publish on a route this repo chose.
             log.error(
                 f"{edition_label} edition for {friendly_date}: fallback "
-                f"provider={fallback_spec.provider!r} model="
-                f"{fallback_spec.model!r} also failed — trying ONE "
-                f"forced-search Anthropic last-resort attempt before "
-                f"aborting."
+                f"also failed ({primary_failed_exc}) — no further compelled "
+                f"route to try. Failing closed (model-router-policy §5.3): "
+                f"no episode today."
             )
-            try:
-                ultimate_spec = _anthropic_default_spec(config)
-                ultimate_client = LLMClient(ultimate_spec, callsite_id="morning-signal-episode-ultimate", max_retries=5)
-                script, fallback_outcome = _attempt_episode(
-                    ultimate_client, config, prompt_text, user_content,
-                    date_str, edition, required_topics, effective_edition,
-                    edition_label, friendly_date, force_search=True,
-                )
-                used_spec = ultimate_spec
-                fell_back = True
-                primary_failed_exc = None
-            except Exception as exc:
-                log.error(
-                    f"{edition_label} edition for {friendly_date}: forced-"
-                    f"search Anthropic last-resort also failed ({exc}) — "
-                    f"aborting episode for today."
-                )
-                fallback_outcome = None
-                primary_failed_exc = exc
+            _alert_fallback_exhausted(
+                config, edition, edition_label, friendly_date, primary_spec,
+                primary_failed_exc,
+            )
 
     if not script and primary_failed_exc is not None:
         # Either not fallback-eligible (anthropic-only config, or
-        # MORNING_SIGNAL_LLM pinned) — original hard-abort behavior — or
-        # every eligible tier (primary, tier-2 fallback, tier-3 forced-search
-        # last-resort) was exhausted. primary_failed_exc always holds the
-        # LAST tier's exception at this point.
+        # MORNING_SIGNAL_LLM pinned) — original hard-abort behavior — or the
+        # fallback tier was also exhausted, in which case
+        # `_alert_fallback_exhausted` already fired above. primary_failed_exc
+        # always holds the LAST tier's exception at this point.
         raise primary_failed_exc
 
     _record_llm_decision(

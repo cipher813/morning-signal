@@ -1,12 +1,17 @@
 """Tests for ``scripts/canary.py`` (ROADMAP L380 Phase A).
 
-The script itself dispatches a live Anthropic ``messages.create()`` call
-in production — these tests stub the network boundary and exercise the
-exit-code matrix (no API key / SSM failure / config load failure /
-payload-build failure / HTTP 400 / HTTP 5xx / OK).
+The script dispatches a live ``max_tokens=1`` call through
+``krepis.llm.LLMClient`` in production — routed through the krepis router
+as of alpha-engine-config-I6980, rather than a direct
+``anthropic.Anthropic`` client. These tests stub the network boundary
+(patching ``sys.modules["anthropic"]``, which krepis's own lazy
+``import anthropic`` picks up transparently for the anthropic-transport
+path the OSS legacy-default fixture config resolves to) and exercise the
+exit-code matrix (no API key / SSM failure / config load failure / request-
+build failure / HTTP 400 / HTTP 5xx / OK).
 
 Mirrors ``tests/live_api_smoke.py``'s philosophy: validate the
-producer-side surface (config + prompt + payload-build chain) without
+producer-side surface (config + prompt + spec-resolution chain) without
 hitting the real API. Live API coverage is the CI smoke
 (``.github/workflows/live-api-smoke.yml``) plus production runtime.
 """
@@ -109,29 +114,38 @@ def test_canary_returns_1_on_invalid_edition(canary_module, monkeypatch):
     assert canary_module.main() == 1
 
 
-def test_canary_builds_production_shape_payload(canary_module):
-    """The canary's payload MUST mirror ``generate_script``'s shape.
-
-    Pins the load-bearing invariants: server-tool present, cache_control
-    on the system block, max_tokens=1, no assistant prefill in messages.
+def test_canary_builds_production_shape_request(canary_module):
+    """The canary's ``(system, user_content)`` pair MUST mirror
+    ``generate_script``'s ``build_episode_request`` shape — the actual
+    payload (server-tool, cache_control, max_tokens, no assistant prefill)
+    is now built and validated by ``krepis.llm.LLMClient`` at dispatch time,
+    the SAME code path ``generate_script`` calls through (see
+    ``test_canary_returns_0_on_successful_dispatch`` for that path's
+    coverage).
     """
-    cfg = {
-        "claude_model": "claude-sonnet-4-6",
-        "max_tokens": 4096,
-        "web_search_max_uses": 20,
-    }
-    payload = canary_module._build_canary_payload(cfg, "2026-05-28", "am")
+    prompt_text, user_content = canary_module._build_canary_request("2026-05-28", "am")
 
-    assert payload["max_tokens"] == 1
-    assert payload["model"] == "claude-sonnet-4-6"
-    assert any(
-        t.get("type", "").startswith("web_search") for t in payload["tools"]
-    )
-    sys_block = payload["system"]
-    assert isinstance(sys_block, list) and sys_block
-    assert sys_block[0].get("cache_control") == {"type": "ephemeral"}
-    for msg in payload["messages"]:
-        assert msg["role"] != "assistant"
+    assert prompt_text == "Weekday system prompt."
+    assert "2026-05-28" not in prompt_text  # date lives in user_content, not system
+    assert "Thursday, May 28, 2026" in user_content
+    assert "MORNING edition" in user_content
+    assert "MUST begin verbatim" in user_content
+
+
+def test_canary_resolves_the_same_spec_generate_script_would(canary_module):
+    """The canary resolves through ``resolve_llm_spec`` — the SAME function
+    ``generate_script``'s primary calls — so a router group that will not
+    resolve here fails the canary identically to how it would fail the
+    real episode. The fixture config has no ``llm`` key, so this locks in
+    the legacy anthropic-default resolution path (OSS self-host mode,
+    outside I6980's scope) rather than a router group.
+    """
+    from morning_signal.claude import resolve_llm_spec
+
+    cfg = {"claude_model": "claude-sonnet-4-6", "max_tokens": 4096}
+    spec = resolve_llm_spec(cfg)
+    assert spec.provider == "anthropic"
+    assert spec.model == "claude-sonnet-4-6"
 
 
 def test_canary_returns_0_on_successful_dispatch(canary_module):

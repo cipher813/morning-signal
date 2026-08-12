@@ -16,16 +16,25 @@ Examples this catches that CI does not:
     update ``pyproject.toml``.
 
 Behavior: loads the EXACT production config + prompts the next
-``generate_script`` call would use (via the same
-``_maybe_load_from_ssm`` bootstrap), builds the EXACT same payload
-shape with ``max_tokens=1``, dispatches a single
-``messages.create()`` call (~$0.001), and exits 0/1.
+``generate_script`` call would use (via the same ``_maybe_load_from_ssm``
+bootstrap), resolves the SAME spec ``generate_script``'s primary would
+(``morning_signal.claude.resolve_llm_spec`` — through the krepis router
+when ``llm`` names a group, refusing anything outside
+``_COMPELLED_ROUTES``), and dispatches a single ``max_tokens=1`` call
+through ``krepis.llm.LLMClient`` (~$0.001), and exits 0/1.
+
+Routed through krepis rather than a direct ``anthropic.Anthropic`` client
+as of alpha-engine-config-I6980 — this script previously bypassed the
+router entirely, which is a direct-provider call this consumer is not
+permitted to make (`model-router-policy` R26).
 
 Exit codes:
-  0 — payload validated by ``krepis.anthropic_payload`` AND
-      accepted by the Anthropic API at runtime.
-  1 — validation failure, HTTP 4xx (the canonical regression class),
-      missing API key, or any unexpected error.
+  0 — request validated by ``krepis.llm.LLMClient`` (server-tool ⊥
+      assistant-prefill shape included) AND accepted by the resolved
+      provider at runtime.
+  1 — spec resolution failure (the router group did not resolve —
+      generate_script's primary would fail identically), request/shape
+      validation failure, an API-level rejection, or any unexpected error.
 
 This is Phase A — the script itself. Phase B is wiring it into the
 ``morning-signal.service`` unit as an ``ExecStartPre=`` so a payload-shape
@@ -46,17 +55,18 @@ from pathlib import Path
 # ``.venv/bin/python scripts/canary.py`` from the systemd unit).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from krepis.anthropic_payload import (  # noqa: E402
-    build_messages_payload,
-    build_web_search_tool,
-)
+from krepis.llm import LLMClient, SearchOptions  # noqa: E402
+from krepis.llm_config import LLMConfigError  # noqa: E402
 from morning_signal import aws as _aws  # noqa: E402
 from morning_signal import config as _config  # noqa: E402
 from morning_signal.aws import _maybe_load_from_ssm  # noqa: E402
 from morning_signal.claude import (  # noqa: E402
     EDITION_LABELS,
+    RouterGroupUnresolvable,
+    _PROVIDERS_WITH_WEB_SEARCH,
     is_non_trading_day,
     opening_line,
+    resolve_llm_spec,
 )
 from morning_signal.config import load_config, load_prompt  # noqa: E402
 
@@ -67,19 +77,24 @@ logging.basicConfig(
 )
 
 
-def _build_canary_payload(
-    config: dict,
+def _build_canary_request(
     date_str: str,
     edition: str,
-) -> dict:
-    """Construct the SAME payload shape ``generate_script`` builds,
-    differing only in ``max_tokens=1``.
+) -> tuple[str, str]:
+    """Construct the SAME ``(system, user_content)`` pair ``generate_script``
+    builds — everything that varies with date/edition, so any payload-shape
+    regression there is caught here too.
 
-    Mirrors ``morning_signal.claude.generate_script`` so any payload-
-    shape regression there is caught here. ``build_messages_payload``
-    runs ``validate_payload`` internally; the server-tool ⊥
-    assistant-prefill invariant + the cache-control + tool-call shape
-    are enforced at lib level identically.
+    The payload itself (cache-control, server-tool ⊥ assistant-prefill
+    shape, tool-call shape) is now built and validated by
+    ``krepis.llm.LLMClient`` at dispatch time — the SAME code path
+    ``generate_script`` calls through, rather than a duplicate local build.
+    Routing through ``LLMClient`` (alpha-engine-config-I6980) is what makes
+    that true: this script previously constructed the Anthropic payload with
+    a hardcoded ``claude_model`` and dispatched it with a bare
+    ``anthropic.Anthropic`` client, which is a direct-provider call this
+    consumer is not permitted to make — see ``_COMPELLED_ROUTES`` in
+    ``morning_signal.claude``.
     """
     weekend = is_non_trading_day(date_str)
     prompt_text = load_prompt(weekend=weekend)
@@ -88,10 +103,6 @@ def _build_canary_payload(
     friendly_date = dt.strftime("%A, %B %-d, %Y")
     edition_label = "WEEKEND" if weekend else EDITION_LABELS[edition]
     opener = opening_line(edition, weekend)
-
-    tools = [
-        build_web_search_tool(max_uses=config.get("web_search_max_uses", 20))
-    ]
 
     user_content = (
         f"Today is {friendly_date}. This is the {edition_label} edition "
@@ -104,14 +115,7 @@ def _build_canary_payload(
         f"{opener}"
     )
 
-    return build_messages_payload(
-        model=config.get("claude_model", "claude-sonnet-4-6"),
-        system_prompt=prompt_text,
-        user_content=user_content,
-        max_tokens=1,
-        tools=tools,
-        cache_system=True,
-    )
+    return prompt_text, user_content
 
 
 def main() -> int:
@@ -132,25 +136,6 @@ def main() -> int:
             "service to ExecStart.",
             type(exc).__name__,
             exc,
-        )
-        return 1
-
-    # Checked AFTER the bootstrap attempt, not before: in production
-    # (MORNING_SIGNAL_USE_SSM=1) ANTHROPIC_API_KEY is not set by the
-    # systemd unit's Environment= directives at all — _maybe_load_from_ssm()
-    # is what populates it, from /morning-signal/anthropic-api-key. Checking
-    # for the var before calling that bootstrap meant this script could
-    # never actually pass when run the way ExecStartPre/an operator would
-    # run it against the live SSM path; only a local run with the key
-    # pre-exported (bypassing SSM) ever exercised this successfully.
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        log.error(
-            "canary: ANTHROPIC_API_KEY not set even after the SSM bootstrap "
-            "attempt. Either /morning-signal/anthropic-api-key is missing/"
-            "unreadable in SSM (with MORNING_SIGNAL_USE_SSM=1), or this is a "
-            "local run without MORNING_SIGNAL_USE_SSM set and without "
-            "ANTHROPIC_API_KEY exported directly."
         )
         return 1
 
@@ -179,62 +164,100 @@ def main() -> int:
         return 1
 
     try:
-        payload = _build_canary_payload(cfg, today, edition)
+        prompt_text, user_content = _build_canary_request(today, edition)
     except Exception as exc:
         log.error(
-            "canary: payload construction failed (%s: %s) — "
-            "validate_payload caught a server-tool ⊥ assistant-prefill "
-            "or similar shape regression at LIB level. DO NOT START.",
+            "canary: request construction failed (%s: %s) — this would "
+            "fail the same way in generate_script. DO NOT START.",
             type(exc).__name__,
             exc,
         )
         return 1
 
+    # Resolve the SAME spec generate_script's primary would resolve —
+    # including, when ``llm`` names a router group, walking the router
+    # (``_resolve_router_group``) and refusing anything outside
+    # ``_COMPELLED_ROUTES``. A router group that will not resolve from this
+    # deployment is exactly the "DO NOT START" condition this canary exists
+    # to catch (alpha-engine-config-I6980: this script previously bypassed
+    # the router entirely and dispatched straight to the Anthropic API,
+    # which is a direct-provider call this consumer is not permitted to
+    # make).
     try:
-        import anthropic
-    except ImportError:
-        log.error("canary: anthropic SDK not installed in .venv")
+        spec = resolve_llm_spec(cfg)
+    except RouterGroupUnresolvable as exc:
+        log.error(
+            "canary: FAILED — the configured router group did not resolve "
+            "from this deployment (%s). generate_script's primary would "
+            "fail identically. DO NOT START.",
+            exc,
+        )
+        return 1
+    except Exception as exc:
+        log.error(
+            "canary: spec resolution raised (%s: %s). DO NOT START.",
+            type(exc).__name__,
+            exc,
+        )
         return 1
 
-    client = anthropic.Anthropic(max_retries=0, api_key=api_key)
-    model = payload.get("model")
+    llm_client = LLMClient(spec, callsite_id="morning-signal-canary", max_retries=0)
 
     log.info(
-        "canary: dispatching max_tokens=1 smoke to %s (edition=%s, "
-        "config=%s)",
-        model,
+        "canary: dispatching max_tokens=1 smoke to provider=%s model=%s "
+        "(edition=%s, config=%s)",
+        spec.provider,
+        spec.model,
         edition,
         _config.CONFIG_FILE,
     )
 
     try:
-        resp = client.messages.create(**payload)
-    except anthropic.BadRequestError as exc:
+        if spec.provider in _PROVIDERS_WITH_WEB_SEARCH:
+            result = llm_client.complete_grounded(
+                system=prompt_text,
+                user_content=user_content,
+                search=SearchOptions(
+                    max_uses=cfg.get("web_search_max_uses", 20),
+                    force_first=False,
+                ),
+                max_tokens=1,
+                cache_system=True,
+            )
+        else:
+            result = llm_client.complete(
+                system=prompt_text,
+                user_content=user_content,
+                max_tokens=1,
+                cache_system=True,
+                on_unsupported="drop",
+            )
+    except LLMConfigError as exc:
         log.error(
-            "canary: FAILED — Anthropic returned HTTP 400.\n"
-            "  Error: %s\n"
-            "  This is the exact regression class the canary is meant "
-            "to catch (see ROADMAP L380; the 2026-05-26 server-tool ⊥ "
-            "assistant-prefill incident). DO NOT START the service.",
+            "canary: FAILED — %s resolved to provider=%s, which krepis "
+            "rejected as a shape/config mismatch: %s. This is the exact "
+            "regression class the canary is meant to catch (see ROADMAP "
+            "L380; the 2026-05-26 server-tool ⊥ assistant-prefill "
+            "incident, and the router-group payload-shape regression this "
+            "canary now also covers). DO NOT START the service.",
+            spec.model,
+            spec.provider,
             exc,
         )
         return 1
-    except anthropic.APIStatusError as exc:
-        log.error("canary: API returned %s: %s", exc.status_code, exc)
-        return 1
     except Exception as exc:
         log.error(
-            "canary: unexpected error (%s: %s)",
+            "canary: unexpected error (%s: %s). DO NOT START.",
             type(exc).__name__,
             exc,
         )
         return 1
 
     log.info(
-        "canary: OK — stop_reason=%s input_tokens=%s output_tokens=%s",
-        resp.stop_reason,
-        resp.usage.input_tokens,
-        resp.usage.output_tokens,
+        "canary: OK — provider=%s model=%s usage=%s",
+        result.provider,
+        result.model,
+        result.usage,
     )
     return 0
 
