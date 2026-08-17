@@ -1101,6 +1101,90 @@ def test_a_direct_provider_route_is_still_refused(monkeypatch, tmp_path):
     assert "openrouter" in str(exc.value)
 
 
+class TestRouterPathDoesNotShadowTheRegistryBudget:
+    """`max_tokens` is a registry-owned parameter (model-router-policy §2).
+
+    Until fixed, `_resolve_router_group` passed
+    `spec.max_tokens or config.get("max_tokens", 4096)` to
+    `resolve_group_spec` — and `spec` is the inert declared ModelSpec, whose
+    `max_tokens` krepis' dataclass forces to always be a truthy int. That
+    `or` therefore NEVER short-circuited to `config.get(...)`, and
+    `config.get(...)`'s own default meant this call NEVER once passed `None`
+    to `resolve_group_spec` — so the registry's row for whichever model the
+    group resolves to (`high` currently means DeepSeek V4 Pro Max, a
+    reasoning model) was silently shadowed by this repo's own default on
+    every single router call.
+
+    Live-verified 2026-08-17 (alpha-engine-config, filed alongside this fix):
+    identical to crucible-evaluator's Director bug
+    (alpha-engine-config-I6396, crucible-evaluator#176) — "the call site's
+    max_tokens=8000 shadowed the registry budget" — and to the reasoning-
+    model budget-starvation class generally (alpha-engine-config-I6901):
+    max_tokens bounds reasoning AND content from one shared pool, so a
+    budget sized for a non-reasoning answer can return a fully-billed EMPTY
+    response.
+    """
+
+    def test_unconfigured_max_tokens_passes_none_to_the_resolver(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+        edge_spec = ModelSpec(
+            "litellm_proxy", "high",
+            base_url="https://router.nousergon.ai:8443",
+            api_key_env="ROUTER_CONSUMER_MORNINGSIGNAL",
+            max_tokens=65536,
+        )
+        seen: dict = {}
+
+        def _fake_resolve(group, *, max_tokens=None, **kw):
+            seen["max_tokens"] = max_tokens
+            return edge_spec, {"route": "litellm_proxy"}
+
+        monkeypatch.setattr("krepis.router.resolve_group_spec", _fake_resolve)
+
+        config = _base_config()
+        del config["max_tokens"]
+        claude._resolve_router_group(
+            claude.declared_llm_spec(config), config
+        )
+
+        assert seen["max_tokens"] is None, (
+            f"_resolve_router_group passed max_tokens={seen['max_tokens']!r} "
+            "to resolve_group_spec with no operator override configured — "
+            "this shadows the registry's row for the resolved model instead "
+            "of deferring to it, resurrecting the Director/I6901 bug class."
+        )
+
+    def test_an_explicit_operator_override_still_reaches_the_resolver(
+        self, monkeypatch, tmp_path
+    ):
+        """The override escape hatch (config.yaml.example's commented-out
+        `max_tokens:`) must still work — this fix removes the SILENT
+        default, not the ability to override deliberately."""
+        monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+        edge_spec = ModelSpec(
+            "litellm_proxy", "high",
+            base_url="https://router.nousergon.ai:8443",
+            api_key_env="ROUTER_CONSUMER_MORNINGSIGNAL",
+            max_tokens=65536,
+        )
+        seen: dict = {}
+
+        def _fake_resolve(group, *, max_tokens=None, **kw):
+            seen["max_tokens"] = max_tokens
+            return edge_spec, {"route": "litellm_proxy"}
+
+        monkeypatch.setattr("krepis.router.resolve_group_spec", _fake_resolve)
+
+        config = _base_config(max_tokens=12000)
+        claude._resolve_router_group(
+            claude.declared_llm_spec(config), config
+        )
+
+        assert seen["max_tokens"] == 12000
+
+
 def test_the_degraded_route_alert_names_the_running_edition(monkeypatch, tmp_path):
     """`send_alert` passes the edition to `notify.make_doctor`, which uses it to
     pick the notification target — so a hardcoded value sends a PM-edition alert
