@@ -114,7 +114,7 @@ dependencies = [
     # how `scripts/oss_bakeoff.py` — the only caller here with no fallback —
     # has exited 1 every Wednesday.
     # Verified by running the full suite against 0.48.0 before raising.
-    "krepis[anthropic,openai]>=0.48.0,<0.49.0",
+    "krepis[anthropic,openai]>=0.48.0,<0.60.0",
     "pydantic>=2.0",
     # Pydantic v2 cannot eval PEP 604 `str | None` field annotations under
     # Python 3.9 even with `from __future__ import annotations` (mirrors krepis).
