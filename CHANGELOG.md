@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-08-17
+
+### Fixed
+
+- **The router path no longer silently shadows the krepis registry's
+  output-token budget.** `_resolve_router_group` passed
+  `spec.max_tokens or config.get("max_tokens", 4096)` to
+  `resolve_group_spec` — `spec` is an inert `ModelSpec` whose `max_tokens`
+  krepis' dataclass forces to always be a truthy int, so the `or` never
+  once fell through, and `resolve_group_spec` never once deferred to the
+  registry's row for whichever model the `llm` group resolves to. Same bug
+  as crucible-evaluator's Director (alpha-engine-config-I6396): a call-site
+  literal silently wins over the registry-owned budget
+  (model-router-policy §2), with no warning and no trace in any log. The
+  krepis `high` group currently resolves to DeepSeek V4 Pro Max, a
+  reasoning model — `max_tokens` bounds reasoning AND content from one
+  shared pool (alpha-engine-config-I6901), so a budget sized for a
+  non-reasoning answer can starve content generation entirely. `max_tokens`
+  in `config.yaml` is now an explicit opt-in override on the router path;
+  leaving it unset lets krepis use the registry's row. The direct-Anthropic
+  self-hosted default path is unaffected (no registry to defer to there).
+
 ## [0.2.1] — 2026-08-02
 
 ### Changed

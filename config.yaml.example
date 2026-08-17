@@ -93,7 +93,20 @@ schedule:
 # llm: '{"provider": "litellm", "model": "high"}'
 # llm: "anthropic:claude-sonnet-4-6"
 claude_model: "claude-sonnet-4-6"  # legacy knob — feeds the default spec
-max_tokens: 8192
+
+# Output-token budget. On the direct-anthropic path (no `llm:` router group
+# set above) this is the only budget there is, and 8192 is a sane default.
+#
+# On the krepis router path (`llm: '{"provider": "litellm", ...}'`), leave
+# this UNSET — omitting it lets krepis use the registry's own budget for
+# whatever model the group resolves to, which model-router-policy §2 makes
+# a registry-owned parameter. Setting it here OVERRIDES that row on every
+# call, including for a reasoning model, where max_tokens bounds reasoning
+# AND content from one shared pool — a budget sized for a non-reasoning
+# answer can starve content generation entirely before it starts
+# (alpha-engine-config-I6901). Uncomment only if you have measured that a
+# specific model's registry row is wrong for your workload.
+# max_tokens: 8192
 
 # Hard cap on Anthropic ``web_search`` server-tool requests per episode.
 # Insurance against runaway loops — Anthropic bills $10 per 1,000 search

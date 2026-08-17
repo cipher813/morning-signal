@@ -179,6 +179,10 @@ def _anthropic_default_spec(config: dict) -> ModelSpec:
     """The anthropic-transport spec used as :func:`resolve_llm_spec`'s
     legacy default and as the final-layer fallback when no
     ``fallback_llm`` is configured.
+
+    Not a router path — there is no krepis registry row to defer to for a
+    bare direct-Anthropic call, so a literal default is correct here. See
+    :func:`_resolve_router_group` for why the router path must NOT do this.
     """
     return ModelSpec(
         "anthropic",
@@ -228,6 +232,11 @@ def resolve_fallback_spec(config: dict) -> ModelSpec:
             f"'router' or 'litellm', e.g. {{\"provider\": \"router\", "
             f"\"model\": \"med\"}})."
         )
+    # This ModelSpec.max_tokens is decorative — krepis.llm_config.ModelSpec
+    # requires an int, but nothing reads this field back. The actual budget
+    # is decided in _resolve_router_group, which reads config directly (not
+    # this spec) so it can pass None through to the registry when unset. See
+    # that function's comment for why.
     declared = ModelSpec("router", group, max_tokens=config.get("max_tokens", 4096))
     return _resolve_router_group(declared, config)
 
@@ -336,7 +345,28 @@ def _resolve_router_group(spec: ModelSpec, config: dict) -> ModelSpec:
             # decision. Mirrors alpha-engine-research's `single_agent.py`
             # challenger call site, which passes it explicitly for this reason.
             wire="openai",
-            max_tokens=spec.max_tokens or config.get("max_tokens", 4096),
+            # config, NOT spec.max_tokens — `spec` is the inert declared
+            # ModelSpec, whose max_tokens is ALWAYS a truthy int (krepis'
+            # ModelSpec forces one; see declared_llm_spec/resolve_fallback_spec
+            # above). Reading it here meant this call NEVER passed None, so
+            # `resolve_group_spec` never once deferred to the registry's row
+            # for whichever model the group resolves to — every router call
+            # silently shadowed it with this repo's own default, the exact bug
+            # crucible-evaluator's Director shipped and fixed
+            # (alpha-engine-config-I6396, crucible-evaluator#176): "max_tokens
+            # is a registry-owned parameter (model-router-policy §2); a literal
+            # here wins over it with no warning and no trace in any log."
+            #
+            # `high` currently resolves to DeepSeek V4 Pro Max, a reasoning
+            # model — max_tokens bounds reasoning AND content from ONE shared
+            # pool (alpha-engine-config-I6901), so a config default sized for
+            # a non-reasoning answer can starve content generation entirely.
+            # config.get("max_tokens") is None unless an operator explicitly
+            # set it, which is exactly when resolve_group_spec's contract says
+            # to override the registry: "passing neither takes the registry
+            # values, which is what a caller with no specific requirement
+            # should do."
+            max_tokens=config.get("max_tokens"),
         )
     except Exception as exc:
         raise RouterGroupUnresolvable(
@@ -458,6 +488,8 @@ def declared_llm_spec(config: dict) -> ModelSpec:
 
     group = _router_group_from_raw(raw)
     if group is not None:
+        # Decorative — see resolve_fallback_spec's comment on the identical
+        # construction above. _resolve_router_group reads config directly.
         return ModelSpec(
             "router", group, max_tokens=config.get("max_tokens", 4096)
         )
@@ -819,7 +851,12 @@ def call_with_grounding_degrade(
                 max_uses=config.get("web_search_max_uses", 20),
                 force_first=force,
             ),
-            max_tokens=config.get("max_tokens", 4096),
+            # None unless an operator explicitly set config 'max_tokens' — see
+            # _resolve_router_group's comment (alpha-engine-config-I6396,
+            # I6901). A literal default here shadows the router-resolved
+            # model's registry-owned budget on every call, reasoning models
+            # included.
+            max_tokens=config.get("max_tokens"),
             cache_system=True,
         )
 
@@ -827,7 +864,7 @@ def call_with_grounding_degrade(
         complete_result = llm_client.complete(
             system=prompt_text,
             user_content=user_content,
-            max_tokens=config.get("max_tokens", 4096),
+            max_tokens=config.get("max_tokens"),
             cache_system=True,
             on_unsupported="drop",
         )
