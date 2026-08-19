@@ -49,6 +49,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .[dev,google]
 
+      # krepis >=0.59.15 (deps#155, merged 2026-08-17) fails every LLM call
+      # closed without a gitleaks binary on PATH — its DLP scan runs
+      # unconditionally before any request leaves the process, real API key
+      # or not. Without this step every test exercising an LLM call path
+      # (test_canary.py, test_claude_recovery.py, test_orchestration.py, ...)
+      # fails with "DLP scan blocked outbound request: gitleaks binary not
+      # found on PATH", which is exactly what happened to `main` from
+      # 2026-08-19 onward. Mirrors krepis's own test.yml step verbatim (same
+      # version/hash) — that repo hit this first and pinned the fix.
+      - name: Install gitleaks (for krepis DLP-gated tests)
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.30.1"
+          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          curl -sSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          # Minimal config so the DLP scan runs against something real
+          # instead of erroring on a missing config dir.
+          sudo mkdir -p /opt/groom-llm-routing
+          printf '[extend]\nuseDefault = true\n' | sudo tee /opt/groom-llm-routing/gitleaks-egress.toml > /dev/null
+
       - name: Run pytest with coverage
         run: pytest
 
