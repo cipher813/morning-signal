@@ -55,6 +55,25 @@ log = logging.getLogger("morning-signal")
 # grounding there comes from the pre-fetched news_context digest.
 _PROVIDERS_WITH_WEB_SEARCH: frozenset[str] = frozenset({"anthropic", "openrouter"})
 
+# Every prompt (prompt.md/prompt_weekend.md/prompt_public.md) unconditionally
+# instructs the model to call a ``web_search`` tool ("you will use web search
+# to gather fresh information", "≤5 web_search calls total"). That's true on
+# the anthropic/openrouter transports but false on every other provider
+# (litellm, openai, direct) — call_with_grounding_degrade's _call_complete()
+# path issues a bare completion with NO tools attached. A model instructed to
+# use a tool it was never given hallucinates one: it emits raw
+# `<tool_calls>`/`<function_calls>`/`<invoke name="...">` XML as its entire
+# response instead of script content. Nothing downstream caught this — the
+# opener-check only prepends a missing opener, and the content-grounding
+# guards are deliberately SKIPPED on this exact path (see
+# `_news_context_grounded` in `_attempt_episode`) because it's expected to
+# have zero searches/citations by construction. Root-caused live 2026-08-19:
+# every AM episode since 2026-08-13 (the litellm_proxy router migration)
+# aired 198-911 chars of tool-call XML instead of a script.
+_TOOL_CALL_HALLUCINATION_RE = re.compile(
+    r"<\s*(tool_calls|function_calls)\s*>|<\s*invoke\s+name\s*=", re.IGNORECASE
+)
+
 
 def verify_script_grounded(
     script: str,
@@ -861,9 +880,24 @@ def call_with_grounding_degrade(
         )
 
     def _call_complete() -> GroundedResult:
+        # The system prompt still tells the model "you will use web search"
+        # (it's shared verbatim with the grounded transports — see the
+        # _TOOL_CALL_HALLUCINATION_RE comment above). This call attaches no
+        # tools, so override that instruction in the user turn — the one
+        # part of the payload this path already varies per call — rather
+        # than forking a second prompt file per transport.
+        degraded_user_content = (
+            f"{user_content}\n\n"
+            f"IMPORTANT: this call has NO web_search tool or any other tool "
+            f"attached — ignore any instruction above to call one. Write the "
+            f"script using ONLY the news context already provided. Do not "
+            f"emit a tool call, function call, or any XML/JSON invoking a "
+            f"tool by name; there is nothing on the other end to receive it "
+            f"and doing so will corrupt the aired episode."
+        )
         complete_result = llm_client.complete(
             system=prompt_text,
-            user_content=user_content,
+            user_content=degraded_user_content,
             max_tokens=config.get("max_tokens"),
             cache_system=True,
             on_unsupported="drop",
@@ -1196,6 +1230,25 @@ def _attempt_episode(
         llm_client, config, prompt_text, user_content, date_str, edition,
         force_search=force_search,
     )
+
+    # Backstop against tool-call hallucination (see
+    # _TOOL_CALL_HALLUCINATION_RE): a model instructed toward web_search but
+    # given no tool can emit raw `<tool_calls>`/`<invoke name=...>` XML as
+    # its entire response. This is unconditional (not just on the
+    # non-grounded path below) — the content-grounding checks that would
+    # normally catch a hollow script are themselves SKIPPED when
+    # _news_context_grounded, which is exactly the condition under which
+    # this failure mode occurs. Treated as a hard-abort of THIS attempt,
+    # same as the content-grounding/required-topics raises below: it
+    # triggers generate_script's fallback tier rather than airing garbage.
+    if _TOOL_CALL_HALLUCINATION_RE.search(result.text):
+        raise RuntimeError(
+            f"{edition_label} edition for {friendly_date}: "
+            f"provider={llm_client.spec.provider!r} model="
+            f"{llm_client.spec.model!r} emitted an unexecuted tool call "
+            f"instead of script content ({len(result.text)} chars): "
+            f"{result.text[:200]!r} — refusing to publish"
+        )
 
     # When the transport lacks server-side web search (litellm, openai,
     # direct), the pre-fetched news_context digest injected by

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every AM episode since the 2026-08-13 litellm_proxy router migration
+  aired unexecuted tool-call XML instead of a script.** Every prompt
+  (`prompt.md`/`prompt_weekend.md`/`prompt_public.md`) unconditionally
+  instructs the model to call a `web_search` tool. On a transport with no
+  server-side search (litellm, openai, direct), `call_with_grounding_degrade`
+  degrades to a bare `complete()` call with no tools attached — but the
+  system prompt still told the model it had one. The model dutifully
+  hallucinated `<tool_calls>`/`<invoke name="...">` XML as its entire
+  response, and nothing caught it: the content-grounding guards that would
+  normally reject a hollow script are the exact guards this path skips
+  (zero searches/citations is *expected* here by construction). Root-caused
+  live 2026-08-19 against the production box (`i-09b539c844515d549`) —
+  `script_chars` in every `{date}-am.llm_decision.json` since 2026-08-13 was
+  198-911 (normal: 3,000-15,000). Fixed at two layers: (1) the `complete()`
+  degrade path now explicitly tells the model it has no tools and to use
+  only the provided news context; (2) a backstop guard rejects any script
+  containing unexecuted tool-call XML and raises, engaging the same
+  fallback-tier cascade as any other hard-abort, rather than publishing it.
+
 ## [0.2.2] — 2026-08-17
 
 ### Fixed
