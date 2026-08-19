@@ -218,6 +218,29 @@ def test_canary_succeeds_when_key_comes_only_from_ssm(monkeypatch):
             "claude_model: claude-sonnet-4-6\n"
             "max_tokens: 4096\n"
             "web_search_max_uses: 20\n"
+            # `llm` is REQUIRED on a MORNING_SIGNAL_USE_SSM=1 deployment as of
+            # this branch: the call site fails closed rather than defaulting to
+            # a hardcoded Anthropic model (model-router-policy). This test's
+            # subject is that the API key resolves from SSM and not from the
+            # process environment — the missing key made its FIXTURE incomplete
+            # under the new contract; it did not make the assertion wrong.
+            #
+            # Deliberately a direct-Anthropic spec, NOT a router group: this
+            # test's seam is a mocked ``anthropic`` module and it asserts
+            # ``fake_client.messages.create`` was actually called — a router
+            # group would send the call through ``_resolve_router_group`` /
+            # ``krepis.router.resolve_group_spec`` instead, which needs a real
+            # registry (LLM_MODEL_REGISTRY.yaml) or an authenticated LiteLLM
+            # edge this test never mocks. Router-group resolution has its own
+            # coverage elsewhere; this fixture only needs `llm` to be SET so
+            # the SSM-mode fail-closed guard does not fire.
+            #
+            # The value is a JSON STRING, not a nested YAML mapping.
+            # `declared_llm_spec` does `raw = str(configured)` then parses raw
+            # as JSON, so a YAML mapping arrives as a single-quoted Python repr
+            # and fails with "Expecting property name enclosed in double
+            # quotes". Matches the form the error message itself prescribes.
+            "llm: '{\"provider\": \"anthropic\", \"model\": \"claude-sonnet-4-6\"}'\n"
         ),
         Type="SecureString",
     )

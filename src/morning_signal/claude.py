@@ -195,13 +195,33 @@ LLM_DECISION_S3_PREFIX = "ops/llm_decisions/"
 
 
 def _anthropic_default_spec(config: dict) -> ModelSpec:
-    """The anthropic-transport spec used as :func:`resolve_llm_spec`'s
-    legacy default and as the final-layer fallback when no
-    ``fallback_llm`` is configured.
+    """The direct-Anthropic spec used as :func:`declared_llm_spec`'s default
+    for a SELF-HOSTED deployment (no ``MORNING_SIGNAL_USE_SSM``) that has
+    not configured ``llm``.
 
-    Not a router path — there is no krepis registry row to defer to for a
-    bare direct-Anthropic call, so a literal default is correct here. See
-    :func:`_resolve_router_group` for why the router path must NOT do this.
+    This docstring previously also named ``resolve_fallback_spec``'s
+    final-layer fallback as a caller. That is stale: `resolve_fallback_spec`
+    no longer calls this function at all (alpha-engine-config-I6980) — it
+    fails closed itself (:exc:`LLMConfigError`) when ``fallback_llm`` is
+    unset, per model-router-policy §5.3. This is the ONLY remaining call
+    site.
+
+    `model-router-policy` §2/§5 forbids a Nous-Ergon call site holding a
+    hardcoded model slug as a router/degraded-mode default — a fact that
+    appears at layer 5 and nowhere else is a defect. This function is
+    exempt from that rule for exactly one reason: **morning-signal is a
+    public, MIT, self-hostable package**, and a self-hoster's install has
+    no krepis, no router, and no `LLM_MODEL_REGISTRY.yaml` — there is
+    nothing to derive a registry route FROM, so the pre-migration literal
+    default is the correct behaviour there, not a router-policy violation.
+
+    `llm-provider-model-policy` §4's carve-out ("Morning-signal Anthropic
+    fallback ... deliberate resilience cascade") sanctions the direct-
+    Anthropic ROUTE for Nous Ergon's OWN deployment; it does not sanction a
+    hardcoded slug serving as an unannounced DEFAULT on that deployment.
+    :func:`declared_llm_spec` enforces the split: on Nous Ergon's own
+    deployment (``MORNING_SIGNAL_USE_SSM=1``) an unset ``llm`` fails closed
+    instead of reaching this function.
     """
     return ModelSpec(
         "anthropic",
@@ -502,6 +522,29 @@ def declared_llm_spec(config: dict) -> ModelSpec:
     if not raw:
         configured = config.get("llm")
         if not configured:
+            if os.environ.get("MORNING_SIGNAL_USE_SSM") == "1":
+                # Nous Ergon's own deployment. Production's SSM
+                # config-yaml always sets `llm` (see the module docstring's
+                # Phase A note) — reaching here means it does not, which is
+                # a DEPLOY defect, not an absent user choice. model-router-
+                # policy §5.2/R20 forbids a compelled call site defaulting
+                # to a hardcoded direct-provider slug when unconfigured:
+                # that is indistinguishable from spending on the $0-budget
+                # Anthropic route (llm-provider-model-policy §3) silently.
+                # Fail loud instead of reaching for
+                # :func:`_anthropic_default_spec`.
+                raise LLMConfigError(
+                    "config 'llm' is unset on a MORNING_SIGNAL_USE_SSM=1 "
+                    "deployment. model-router-policy forbids defaulting a "
+                    "Nous-Ergon call site to a hardcoded Anthropic model — "
+                    "set 'llm' in /morning-signal/config-yaml to a krepis "
+                    "router group, e.g. {\"provider\": \"router\", "
+                    "\"model\": \"med\"}."
+                )
+            # Self-hosted deployment: no SSM, no router, no registry to
+            # derive a route from — the pre-migration literal default is
+            # correct here, not a router-policy violation. See
+            # :func:`_anthropic_default_spec`'s docstring.
             return _anthropic_default_spec(config)
         raw, source = str(configured), "config 'llm'"
 

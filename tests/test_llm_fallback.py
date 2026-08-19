@@ -1346,3 +1346,52 @@ def test_the_degraded_route_alert_names_the_running_edition(monkeypatch, tmp_pat
     assert editions == ["pm"], (
         f"the degraded-route alert must name the running edition, got {editions!r}"
     )
+
+
+# ── declared_llm_spec's unconfigured-`llm` default ──
+
+
+def test_unset_llm_on_self_hosted_deployment_uses_the_legacy_anthropic_default(
+    monkeypatch,
+):
+    """No `MORNING_SIGNAL_USE_SSM` (a self-hosted install, per README) with no
+    `llm` configured MUST keep the pre-migration literal default: those
+    installs have no krepis, no router, and no registry to derive a route
+    from, so a hardcoded direct-Anthropic spec is correct there, not a
+    model-router-policy violation (see `_anthropic_default_spec`'s
+    docstring)."""
+    monkeypatch.delenv("MORNING_SIGNAL_USE_SSM", raising=False)
+    cfg = {"claude_model": "claude-haiku-4-5", "max_tokens": 111}
+
+    spec = claude.declared_llm_spec(cfg)
+
+    assert spec.provider == "anthropic"
+    assert spec.model == "claude-haiku-4-5"
+    assert spec.max_tokens == 111
+
+
+def test_unset_llm_on_nous_ergon_deployment_fails_closed(monkeypatch):
+    """`MORNING_SIGNAL_USE_SSM=1` (Nous Ergon's own deployment) with no `llm`
+    configured is a deploy defect, not an absent user choice — production's
+    SSM config-yaml always sets `llm`. model-router-policy §5.2/R20 forbids
+    defaulting a compelled call site to a hardcoded direct-provider slug, so
+    this MUST raise rather than silently reach for the OSS legacy default
+    (which would spend on the $0-budget Anthropic route unannounced)."""
+    monkeypatch.setenv("MORNING_SIGNAL_USE_SSM", "1")
+    cfg = {"claude_model": "claude-haiku-4-5", "max_tokens": 111}
+
+    with pytest.raises(claude.LLMConfigError, match="MORNING_SIGNAL_USE_SSM=1"):
+        claude.declared_llm_spec(cfg)
+
+
+def test_configured_llm_wins_over_the_ssm_fail_closed_check(monkeypatch):
+    """A configured `llm` (the normal production case) must resolve
+    normally on an SSM deployment — the fail-closed check above only fires
+    when `llm` is actually unset."""
+    monkeypatch.setenv("MORNING_SIGNAL_USE_SSM", "1")
+    cfg = {"llm": '{"provider": "router", "model": "med"}', "max_tokens": 111}
+
+    spec = claude.declared_llm_spec(cfg)
+
+    assert spec.provider == "router"
+    assert spec.model == "med"
