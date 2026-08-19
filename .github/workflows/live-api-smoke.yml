@@ -51,6 +51,28 @@ jobs:
         run: |
           pip install -e .
 
+      # alpha-engine-config-I7634: krepis>=0.59.15's LLMClient (session_dlp.py)
+      # fails every call closed without a gitleaks binary on PATH, and this
+      # job's Anthropic call in live_api_smoke.py goes through LLMClient. The
+      # pyproject ceiling (<0.49.0) keeps this job under the affected version
+      # today, but that ceiling is bumped manually and deliberately — the
+      # eventual bump should not also have to notice this prerequisite.
+      # Mirrors test.yml's step and krepis's own test.yml verbatim (same
+      # version/hash) — do not re-derive independently.
+      - name: Install gitleaks (for krepis DLP-gated calls)
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.30.1"
+          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          curl -sSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          sudo mkdir -p /opt/groom-llm-routing
+          printf '[extend]\nuseDefault = true\n' | sudo tee /opt/groom-llm-routing/gitleaks-egress.toml > /dev/null
+
       - name: Dispatch live-API smoke (max_tokens=1)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
