@@ -225,12 +225,22 @@ def test_canary_succeeds_when_key_comes_only_from_ssm(monkeypatch):
             # process environment — the missing key made its FIXTURE incomplete
             # under the new contract; it did not make the assertion wrong.
             #
+            # Deliberately a direct-Anthropic spec, NOT a router group: this
+            # test's seam is a mocked ``anthropic`` module and it asserts
+            # ``fake_client.messages.create`` was actually called — a router
+            # group would send the call through ``_resolve_router_group`` /
+            # ``krepis.router.resolve_group_spec`` instead, which needs a real
+            # registry (LLM_MODEL_REGISTRY.yaml) or an authenticated LiteLLM
+            # edge this test never mocks. Router-group resolution has its own
+            # coverage elsewhere; this fixture only needs `llm` to be SET so
+            # the SSM-mode fail-closed guard does not fire.
+            #
             # The value is a JSON STRING, not a nested YAML mapping.
             # `declared_llm_spec` does `raw = str(configured)` then parses raw
             # as JSON, so a YAML mapping arrives as a single-quoted Python repr
             # and fails with "Expecting property name enclosed in double
             # quotes". Matches the form the error message itself prescribes.
-            "llm: '{\"provider\": \"router\", \"model\": \"med\"}'\n"
+            "llm: '{\"provider\": \"anthropic\", \"model\": \"claude-sonnet-4-6\"}'\n"
         ),
         Type="SecureString",
     )
