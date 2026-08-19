@@ -748,6 +748,125 @@ def test_router_group_primary_succeeds_via_complete(monkeypatch, tmp_path):
     assert decision["fell_back"] is False
 
 
+def test_tool_call_hallucination_on_no_search_transport_falls_back(monkeypatch, tmp_path):
+    """Root cause, live 2026-08-19: every AM episode since the litellm_proxy
+    migration (2026-08-13) aired 198-911 chars of unexecuted tool-call XML
+    instead of a script. The prompt tells the model to call ``web_search``;
+    complete() (the no-server-side-search degrade path) attaches no tools,
+    so the model hallucinates one — and the content-grounding guards that
+    would normally catch a hollow script are the exact guards this
+    transport SKIPS (zero searches/citations is expected here by
+    construction). The hallucination guard must fire regardless, and
+    behave exactly like any other hard-abort of the primary attempt: fall
+    through to the configured fallback rather than publish the garbage.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    litellm_spec = ModelSpec(
+        "litellm_proxy", "high",
+        base_url="https://router.nousergon.ai:8443",
+        api_key_env="ROUTER_CONSUMER_MORNINGSIGNAL",
+        max_tokens=4096,
+    )
+    fallback_spec, fallback_route = _compelled_edge("anthropic", "claude-haiku-4-5")
+    monkeypatch.setattr(
+        "krepis.router.resolve_group_spec",
+        lambda group, **kw: (
+            (fallback_spec, fallback_route) if group == _FALLBACK_GROUP
+            else (litellm_spec, {"route": "litellm_proxy"})
+        ),
+    )
+    plan = {
+        "litellm_proxy": [
+            _grounded(
+                provider="litellm_proxy", model="deepseek-v4-pro",
+                text=(
+                    "Welcome to Morning Signal. <tool_calls>\n"
+                    '<invoke name="search">\n'
+                    '<parameter name="query" string="true">Trump Truth '
+                    "Social posts August 19 2026</parameter>\n"
+                    "</invoke>\n</tool_calls>"
+                ),
+                n_searches=0, citations=[],
+            ),
+        ],
+        "anthropic": [
+            _grounded(provider="anthropic", model="claude-haiku-4-5",
+                      text="Welcome to Morning Signal. Real content here.",
+                      n_searches=5),
+        ],
+    }
+    monkeypatch.setattr(claude, "LLMClient", _client_factory(plan))
+
+    script = claude.generate_script(
+        _base_config(
+            llm='{"provider": "litellm", "model": "high"}',
+            fallback_llm=_FALLBACK_LLM_CONFIG,
+            min_grounding_citations=0,
+        ),
+        "2026-08-19", "am",
+    )
+
+    assert "Real content here" in script
+    assert "tool_calls" not in script
+    decision = json.loads(_decision_path(tmp_path, "2026-08-19").read_text())
+    assert decision["primary_provider"] == "litellm_proxy"
+    assert decision["used_provider"] == "anthropic"
+    assert decision["fell_back"] is True
+    assert decision["primary_outcome"] is None  # the guard raised before an outcome existed
+
+
+def test_complete_degrade_tells_the_model_it_has_no_tools(monkeypatch, tmp_path):
+    """The root-cause fix: call_with_grounding_degrade's complete() path
+    must override the prompt's "you will use web search" instruction —
+    the call it's about to make has no tools attached. Asserts the actual
+    payload sent to ``complete()``, not just the downstream behaviour.
+    """
+    monkeypatch.setattr(claude._config, "EPISODES_DIR", tmp_path)
+    edge_spec = ModelSpec(
+        "litellm_proxy", "high",
+        base_url="https://router.nousergon.ai:8443",
+        api_key_env="ROUTER_CONSUMER_MORNINGSIGNAL",
+        max_tokens=4096,
+    )
+    monkeypatch.setattr(
+        "krepis.router.resolve_group_spec",
+        lambda group, **kw: (edge_spec, {"route": "litellm_proxy"}),
+    )
+
+    captured = {}
+
+    class _CapturingClient:
+        def __init__(self, spec, **kw):
+            self.spec = spec
+
+        def complete_grounded(self, **kw):
+            raise LLMConfigError("complete_grounded unsupported on litellm_proxy")
+
+        def complete(self, **kw):
+            captured["user_content"] = kw["user_content"]
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                text="Welcome to Morning Signal. Real content.",
+                model="deepseek-v4-pro", provider="litellm_proxy",
+                usage=LLMUsage(web_search_requests=0),
+                raw_request={}, raw_response=None,
+            )
+
+    monkeypatch.setattr(claude, "LLMClient", _CapturingClient)
+
+    claude.generate_script(
+        _base_config(
+            llm='{"provider": "litellm", "model": "high"}',
+            min_grounding_citations=0,
+        ),
+        "2026-08-19", "am",
+    )
+
+    assert "no web_search tool" in captured["user_content"].lower() or \
+        "no tool" in captured["user_content"].lower()
+    assert "ignore any instruction above to call" in captured["user_content"].lower()
+
+
 def test_primary_unusable_in_this_deployment_alerts(monkeypatch, tmp_path):
     """A primary that was never CALLABLE here alerts, on top of falling back.
 
