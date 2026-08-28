@@ -310,16 +310,167 @@ def test_main_writes_jsonl_on_success(bakeoff_module, monkeypatch, tmp_path):
 
 
 def test_main_appends_on_repeated_runs(bakeoff_module, monkeypatch, tmp_path):
+    """--force is what a DELIBERATE repeat looks like now: the second run is
+    inside the minimum interval, so an unforced one would (correctly) refuse.
+    What this test still pins is the append, not the cadence."""
     monkeypatch.setattr(bakeoff_module, "LLMClient", _dispatcher(_all_pass_plan()))
     log_dir = tmp_path / "bakeoff_out"
     monkeypatch.setenv(bakeoff_module.BAKEOFF_LOG_DIR_ENV, str(log_dir))
     monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-06", "--edition", "am"])
-
     assert bakeoff_module.main() == 0
+
+    monkeypatch.setattr(
+        sys, "argv",
+        ["oss_bakeoff.py", "--date", "2026-07-06", "--edition", "am", "--force"],
+    )
     assert bakeoff_module.main() == 0
 
     out_path = log_dir / "2026-07-06-am.bakeoff.jsonl"
     assert len(out_path.read_text().strip().splitlines()) == 2
+
+
+# ── Minimum-interval guard (alpha-engine-config-I9000) ──────────────────────
+#
+# 2026-08-28 03:01 UTC: this script ran on a Friday because an unrelated
+# crucible-dashboard deploy re-ran the systemd installer and `Requires=` in the
+# timer's [Unit] made `enable --now <timer>` start the service as a dependency.
+# The launcher is fixed there; these pin the defence in depth here, because a
+# workload that spends money per run must not depend on its launcher being
+# right — and self-hosters supply their own launcher entirely.
+#
+# Every test below asserts BEHAVIOUR — whether a billed comparison happened,
+# read off the JSONL the run writes — not the presence of a flag or a string.
+
+
+def _bill_counting_dispatcher(counter):
+    """A dispatcher that records every LLM call, so 'did this run cost money?'
+    is an assertion rather than an inference from the exit code."""
+    inner = _dispatcher(_all_pass_plan())
+
+    class _Counting(inner):
+        def complete_grounded(self, **kw):
+            counter.append(self.spec.model)
+            return super().complete_grounded(**kw)
+
+    return _Counting
+
+
+def test_a_run_inside_the_minimum_interval_makes_no_billed_call(
+    bakeoff_module, monkeypatch, tmp_path
+):
+    calls: list = []
+    monkeypatch.setattr(bakeoff_module, "LLMClient", _bill_counting_dispatcher(calls))
+    log_dir = tmp_path / "bakeoff_out"
+    monkeypatch.setenv(bakeoff_module.BAKEOFF_LOG_DIR_ENV, str(log_dir))
+
+    # A completed comparison two days earlier — the real shape of the incident:
+    # last legitimate run Wednesday, off-schedule launch Friday.
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-01"])
+    assert bakeoff_module.main() == 0
+    assert calls, "setup: the first run should have made billed calls"
+    calls.clear()
+
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-03"])
+    # Exit 0, not 1: an off-schedule LAUNCH is not a bakeoff failure, and
+    # exiting non-zero would manufacture the failed unit + page this whole fix
+    # exists to remove.
+    assert bakeoff_module.main() == 0
+    assert calls == [], "a refused run must not reach the model"
+    assert not (log_dir / "2026-07-03-am.bakeoff.jsonl").exists()
+
+
+def test_the_next_weekly_run_still_happens(bakeoff_module, monkeypatch, tmp_path):
+    """The half that must not be traded away for the half above."""
+    calls: list = []
+    monkeypatch.setattr(bakeoff_module, "LLMClient", _bill_counting_dispatcher(calls))
+    log_dir = tmp_path / "bakeoff_out"
+    monkeypatch.setenv(bakeoff_module.BAKEOFF_LOG_DIR_ENV, str(log_dir))
+
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-01"])
+    assert bakeoff_module.main() == 0
+    calls.clear()
+
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-08"])
+    assert bakeoff_module.main() == 0
+    assert calls, "the next Wednesday is due and must run"
+    assert (log_dir / "2026-07-08-am.bakeoff.jsonl").exists()
+
+
+def test_a_persistent_catch_up_a_few_days_late_still_runs(
+    bakeoff_module, monkeypatch, tmp_path
+):
+    """`Persistent=true` replays a slot missed while the box was down, which
+    lands the weekly run DAYS late. A day-of-week window would refuse it; a
+    minimum interval must not. This is why the guard is an interval."""
+    calls: list = []
+    monkeypatch.setattr(bakeoff_module, "LLMClient", _bill_counting_dispatcher(calls))
+    log_dir = tmp_path / "bakeoff_out"
+    monkeypatch.setenv(bakeoff_module.BAKEOFF_LOG_DIR_ENV, str(log_dir))
+
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-01"])
+    assert bakeoff_module.main() == 0
+    calls.clear()
+
+    # Box down over the 07-08 slot; comes back 07-11 and systemd replays it.
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-11"])
+    assert bakeoff_module.main() == 0
+    assert calls, "a late catch-up is still a due run"
+
+
+def test_force_overrides_the_interval(bakeoff_module, monkeypatch, tmp_path):
+    calls: list = []
+    monkeypatch.setattr(bakeoff_module, "LLMClient", _bill_counting_dispatcher(calls))
+    log_dir = tmp_path / "bakeoff_out"
+    monkeypatch.setenv(bakeoff_module.BAKEOFF_LOG_DIR_ENV, str(log_dir))
+
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-01"])
+    assert bakeoff_module.main() == 0
+    calls.clear()
+
+    monkeypatch.setattr(
+        sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-02", "--force"]
+    )
+    assert bakeoff_module.main() == 0
+    assert calls, "--force is the deliberate operator re-run"
+
+
+def test_a_failed_run_leaves_no_marker_so_its_retry_is_not_blocked(
+    bakeoff_module, monkeypatch, tmp_path
+):
+    """The marker is the completed-comparison log. A setup failure writes none,
+    so the guard must never turn one bad run into a week of silence."""
+    log_dir = tmp_path / "bakeoff_out"
+    monkeypatch.setenv(bakeoff_module.BAKEOFF_LOG_DIR_ENV, str(log_dir))
+
+    real_run_bakeoff = bakeoff_module.run_bakeoff
+
+    def _boom(*a, **kw):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(bakeoff_module, "run_bakeoff", _boom)
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-01"])
+    assert bakeoff_module.main() == 1
+    assert not list(log_dir.glob("*.bakeoff.jsonl")) if log_dir.exists() else True
+
+    monkeypatch.setattr(bakeoff_module, "run_bakeoff", real_run_bakeoff)
+    calls: list = []
+    monkeypatch.setattr(bakeoff_module, "LLMClient", _bill_counting_dispatcher(calls))
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-02"])
+    assert bakeoff_module.main() == 0
+    assert calls, "the retry after a failure must not be blocked by the guard"
+
+
+def test_the_first_ever_run_is_not_blocked(bakeoff_module, monkeypatch, tmp_path):
+    """An empty (or absent) log dir must read as 'never run', not as 'today'."""
+    calls: list = []
+    monkeypatch.setattr(bakeoff_module, "LLMClient", _bill_counting_dispatcher(calls))
+    monkeypatch.setenv(
+        bakeoff_module.BAKEOFF_LOG_DIR_ENV, str(tmp_path / "never-created")
+    )
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-01"])
+
+    assert bakeoff_module.main() == 0
+    assert calls
 
 
 # ── S3 sync (durability across box replacement, 2026-07-06) ─────────────────

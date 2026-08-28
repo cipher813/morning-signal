@@ -52,9 +52,19 @@ Usage::
 
     python scripts/oss_bakeoff.py --date 2026-07-06 --edition am
 
+Every run issues real, BILLED grounded calls — one per side. It therefore
+refuses to run within ``--min-interval-days`` (default 5) of the last
+completed comparison, whatever started it, and says so; ``--force`` is the
+deliberate operator re-run. That is a minimum interval and not a
+day-of-week window on purpose: a window would also refuse the legitimate
+late run ``Persistent=true`` replays after the box was down at the
+scheduled moment (alpha-engine-config-I9000).
+
 Exit codes: 0 on a completed comparison (regardless of parity outcome — a
-mismatch is exactly what this script exists to surface, not an error);
-1 on a setup/run failure (missing OPENROUTER_API_KEY, SSM bootstrap
+mismatch is exactly what this script exists to surface, not an error) AND
+on a run refused by the interval guard (an off-schedule launch is not a
+bakeoff failure, and exiting non-zero would manufacture a red unit and a
+page); 1 on a setup/run failure (missing OPENROUTER_API_KEY, SSM bootstrap
 failure, LLM call failure on any side).
 """
 
@@ -65,6 +75,7 @@ import datetime as _dt
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -120,6 +131,50 @@ DEFAULT_BAKEOFF_LOG_DIR = "bakeoff_logs"
 # by convention. Runner role already has bucket-wide PutObject, so no new
 # IAM grant is needed for this prefix.
 BAKEOFF_S3_PREFIX = "ops/bakeoff/"
+
+# MINIMUM INTERVAL between two billed comparisons — defence in depth for a
+# workload that spends real money (alpha-engine-config-I9000).
+#
+# On 2026-08-28 this script ran at 03:01 UTC on a Friday. Its timer had not
+# elapsed and would not until the following Wednesday: an unrelated
+# crucible-dashboard deploy re-ran the systemd installer, and `Requires=` in the
+# timer's [Unit] made `systemctl enable --now <timer>` start the service as a
+# dependency. That launcher defect is fixed in crucible-dashboard, and this
+# guard exists because a unit that costs money per run must not rely on its
+# launcher being correct — any launcher, on any box, including one this repo
+# does not own (self-hosters run their own).
+#
+# It is a MINIMUM INTERVAL, deliberately not a day-of-week window. A window
+# would also refuse the legitimate late run that `Persistent=true` replays after
+# the box was down at the scheduled moment — trading one failure mode for
+# another. An interval refuses only what a correct weekly cadence would never
+# produce: a second billed comparison a few days after the last one.
+#
+# Five days, not seven: a weekly timer whose slot was missed can legitimately
+# fire a day or two late, and the guard must not eat that run. It still refuses
+# same-day and next-day repeats, which is the whole observed failure.
+DEFAULT_MIN_INTERVAL_DAYS = 5
+
+# ``{YYYY-MM-DD}-{edition}.bakeoff.jsonl`` — written only after a comparison
+# COMPLETES, so a setup failure leaves no marker and its retry is never blocked.
+_LOG_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(?:am|pm)\.bakeoff\.jsonl$")
+
+
+def _last_bakeoff_date(log_dir: Path) -> "_dt.date | None":
+    """Most recent date a comparison completed for, or None if never."""
+    dates = []
+    try:
+        names = [p.name for p in log_dir.iterdir()]
+    except OSError:
+        return None
+    for name in names:
+        match = _LOG_NAME_RE.match(name)
+        if match:
+            try:
+                dates.append(_dt.date.fromisoformat(match.group(1)))
+            except ValueError:  # pragma: no cover - regex already pins the shape
+                continue
+    return max(dates) if dates else None
 
 
 def _run_side(
@@ -294,7 +349,38 @@ def main() -> int:
              "production episode's own date_str convention)",
     )
     parser.add_argument("--edition", default="am", choices=["am", "pm"])
+    parser.add_argument(
+        "--min-interval-days", type=int, default=DEFAULT_MIN_INTERVAL_DAYS,
+        help="refuse a billed comparison this soon after the last completed "
+             f"one (default: {DEFAULT_MIN_INTERVAL_DAYS}); 0 disables the guard",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="run even inside the minimum interval — for a deliberate operator "
+             "re-run, never for a scheduled one",
+    )
     args = parser.parse_args()
+
+    date_str = args.date or _dt.date.today().isoformat()
+    log_dir = Path(os.environ.get(BAKEOFF_LOG_DIR_ENV, DEFAULT_BAKEOFF_LOG_DIR))
+
+    # BEFORE the AWS/SSM bootstrap and before any billed call: the cheapest
+    # possible place to refuse. Exit 0, not 1 — an off-schedule LAUNCH is not a
+    # bakeoff failure, and paging for it would manufacture exactly the red unit
+    # this guard exists to prevent.
+    last_run = None if args.force else _last_bakeoff_date(log_dir)
+    if last_run is not None and args.min_interval_days > 0:
+        gap_days = (_dt.date.fromisoformat(date_str) - last_run).days
+        if gap_days < args.min_interval_days:
+            log.warning(
+                "bakeoff %s-%s: refusing — last completed comparison was %s "
+                "(%d day(s) ago, minimum interval %d). This is a weekly, BILLED "
+                "comparison; something started it off-schedule. Re-run "
+                "deliberately with --force.",
+                date_str, args.edition, last_run.isoformat(), gap_days,
+                args.min_interval_days,
+            )
+            return 0
 
     try:
         # Mirrors episode.py/cli.py's bootstrap order exactly: assume the
@@ -332,15 +418,12 @@ def main() -> int:
         )
         return 1
 
-    date_str = args.date or _dt.date.today().isoformat()
-
     try:
         record = run_bakeoff(config, date_str, args.edition)
     except Exception:
         log.exception("bakeoff: run failed for %s-%s", date_str, args.edition)
         return 1
 
-    log_dir = Path(os.environ.get(BAKEOFF_LOG_DIR_ENV, DEFAULT_BAKEOFF_LOG_DIR))
     log_dir.mkdir(parents=True, exist_ok=True)
     out_path = log_dir / f"{date_str}-{args.edition}.bakeoff.jsonl"
     with out_path.open("a") as fh:
