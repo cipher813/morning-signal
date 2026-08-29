@@ -48,6 +48,15 @@ to exactly ``episodes/*``/``feed.xml``/``artwork.jpg``, so anything else
 written here, including this prefix, is authenticated-only by the
 policy's own absence).
 
+PAUSED by default (morning-signal-I165, 2026-08-29): the candidate side
+addresses OpenRouter directly (``ModelSpec("openrouter", ...)``), which
+bypasses the krepis router entirely — forbidden by alpha-engine-config-I6367
+and by Brian's 2026-08-29 ruling that every call site funnels through the
+router with no parallel setups. ``main()`` now refuses to dispatch unless
+``MORNING_SIGNAL_BAKEOFF_ALLOW_DIRECT_OPENROUTER=1`` is explicitly set (the
+shipped systemd unit does not set it) — see I165 for what a compliant
+candidate-registration path needs before this resumes on its own schedule.
+
 Usage::
 
     python scripts/oss_bakeoff.py --date 2026-07-06 --edition am
@@ -398,6 +407,32 @@ def main() -> int:
             "bakeoff: SSM bootstrap failed (%s: %s) — the production "
             "service would fail the same way.",
             type(exc).__name__, exc,
+        )
+        return 1
+
+    # Compliance gate (morning-signal-I165): CANDIDATES are dispatched via a
+    # bare ModelSpec("openrouter", ...) — a direct-OpenRouter linkage
+    # alpha-engine-config-I6367 forbids and Brian's 2026-08-29 ruling
+    # ("no other parallel setups, it should all funnel through the krepis
+    # router") reaffirms. There is no krepis/registry mechanism yet to
+    # address a not-yet-registered candidate model through a compelled,
+    # DLP-scanned route (see I165) — until that lands, this refuses the
+    # scheduled dispatch by default rather than spending unsanctioned
+    # OpenRouter tokens through a route this consumer is not permitted to
+    # choose. `--force`/`--min-interval-days` govern WHEN a comparison may
+    # run; this governs WHETHER it may run at all on the current transport.
+    if os.environ.get("MORNING_SIGNAL_BAKEOFF_ALLOW_DIRECT_OPENROUTER") != "1":
+        log.error(
+            "bakeoff: refusing — the candidate comparison dispatches "
+            "directly to OpenRouter (bare ModelSpec, not the krepis "
+            "router), which alpha-engine-config-I6367 and Brian's "
+            "2026-08-29 ruling both forbid. Tracked at "
+            "morning-signal-I165 pending a compliant candidate-"
+            "registration path in krepis/alpha-engine-config. Set "
+            "MORNING_SIGNAL_BAKEOFF_ALLOW_DIRECT_OPENROUTER=1 only for a "
+            "deliberate, manually-run one-off with a human aware it is "
+            "spending real OpenRouter tokens outside the compelled route "
+            "— the shipped systemd unit does NOT set this."
         )
         return 1
 

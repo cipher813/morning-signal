@@ -100,25 +100,27 @@ def _seed_ssm_and_s3(
     bucket: str = "test-bucket",
     prompts_prefix: str = "prompts/",
     config_extras: str = "",
-    anthropic_key: str = "sk-fake-key",
+    anthropic_key: str | None = "sk-fake-key",
     prompt_md: str = "# Test prompt",
     prompt_weekend_md: str | None = None,
     extra_ssm_params: dict[str, str] | None = None,
 ) -> None:
     """Seed the SSM params + S3 objects the bootstrap path reads.
 
-    SSM keeps: anthropic-api-key + config-yaml (small structured/secret).
-    S3 keeps:  prompt.md (+ optional weekend) at
-               s3://{bucket}/{prompts_prefix}<file>.
+    SSM keeps: anthropic-api-key (OPTIONAL — pass ``anthropic_key=None`` to
+    omit it, e.g. an install running entirely on the krepis router) +
+    config-yaml (small structured/secret). S3 keeps: prompt.md (+ optional
+    weekend) at s3://{bucket}/{prompts_prefix}<file>.
 
     Bucket creation routed to ``REGION_S3`` (us-west-2) to match the
     aws_env fixture's ``AWS_DEFAULT_REGION``; moto rejects a
     LocationConstraint mismatch.
     """
     ssm = boto3.client("ssm", region_name=region)
-    ssm.put_parameter(
-        Name="/morning-signal/anthropic-api-key", Value=anthropic_key, Type="SecureString",
-    )
+    if anthropic_key is not None:
+        ssm.put_parameter(
+            Name="/morning-signal/anthropic-api-key", Value=anthropic_key, Type="SecureString",
+        )
     config_body = f"s3_bucket: {bucket}\nprompts_s3_prefix: {prompts_prefix}\n"
     if config_extras:
         config_body += config_extras
@@ -161,6 +163,46 @@ def test_maybe_load_from_ssm_fetches_and_overrides_paths(
     assert fresh_ge_module.PROMPT_FILE.read_text() == "# Test prompt"
     # ANTHROPIC_API_KEY should have been exported into env
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-fake-key"
+
+
+@mock_aws
+def test_maybe_load_from_ssm_tolerates_missing_anthropic_key(
+    fresh_ge_module, aws_env, monkeypatch
+):
+    """2026-08-29: the Anthropic key moved from a REQUIRED `fetch()` to an
+    optional one — Brian's ruling sets the direct-Anthropic API budget to
+    $0, and production generation is meant to be served by the krepis
+    router (``llm`` config key), which holds its own credentials. An
+    install with no ``/morning-signal/anthropic-api-key`` SSM parameter
+    (router-only, or the parameter deliberately removed once the router
+    path is confirmed live) must still boot rather than hard-failing on a
+    credential production doesn't need."""
+    monkeypatch.setenv("MORNING_SIGNAL_USE_SSM", "1")
+    monkeypatch.setenv("MORNING_SIGNAL_SSM_REGION", REGION_OTHER)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    _seed_ssm_and_s3(anthropic_key=None)
+
+    fresh_ge_module._maybe_load_from_ssm()
+
+    assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+@mock_aws
+def test_maybe_load_from_ssm_anthropic_local_override_wins(
+    fresh_ge_module, aws_env, monkeypatch
+):
+    """A pre-set ANTHROPIC_API_KEY (local debugging, or an operator-supplied
+    self-host key) is not overwritten by SSM."""
+    monkeypatch.setenv("MORNING_SIGNAL_USE_SSM", "1")
+    monkeypatch.setenv("MORNING_SIGNAL_SSM_REGION", REGION_OTHER)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "local-override-key")
+
+    _seed_ssm_and_s3(anthropic_key="ssm-key")
+
+    fresh_ge_module._maybe_load_from_ssm()
+
+    assert os.environ["ANTHROPIC_API_KEY"] == "local-override-key"
 
 
 @mock_aws
@@ -352,7 +394,8 @@ def test_maybe_load_from_ssm_loads_openrouter_key_when_present(
 ):
     """The optional OpenRouter key (config#1659 Phase B / shadow-canary use)
     flows into OPENROUTER_API_KEY when the SSM param exists. Not required
-    for production generation (still anthropic-transport only)."""
+    for production generation, which is served by the krepis router (its
+    own credentials) once ``llm`` names a router group."""
     monkeypatch.setenv("MORNING_SIGNAL_USE_SSM", "1")
     monkeypatch.setenv("MORNING_SIGNAL_SSM_REGION", REGION_OTHER)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
