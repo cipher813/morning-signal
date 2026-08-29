@@ -166,14 +166,31 @@ def _maybe_load_from_ssm() -> None:
         )
         _config.PROMPT_WEEKEND_FILE = prompt_path
 
+    # Anthropic key — OPTIONAL as of 2026-08-29 (Brian ruling: "we shouldn't
+    # be using the anthropic api at all" — the direct-Anthropic API budget is
+    # $0). Previously fetched with the REQUIRED `fetch()`, which meant a
+    # production boot hard-failed without a live Anthropic credential even
+    # though ``claude._resolve_router_group``'s compelled routes
+    # (litellm_proxy / egress_proxy) are what SHOULD serve generation once
+    # config's ``llm`` key names a router group (see config.yaml.example).
+    # Treated the same as the router credential below: an install with no
+    # ``/morning-signal/anthropic-api-key`` parameter simply doesn't get one
+    # in the environment, and ``claude._anthropic_default_spec`` (the
+    # legacy/OSS-self-host default — self-hosters bring their own key; this
+    # is not "our" Anthropic usage) fails loudly with a clear missing-
+    # credential error if that path is ever actually reached, rather than
+    # this bootstrap step being the reason the whole process cannot start.
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        os.environ["ANTHROPIC_API_KEY"] = fetch("/morning-signal/anthropic-api-key")
+        anthropic_key = fetch_optional("/morning-signal/anthropic-api-key")
+        if anthropic_key:
+            os.environ["ANTHROPIC_API_KEY"] = anthropic_key
 
-    # OpenRouter key — optional. Not needed for production generation (still
-    # anthropic-transport only) or by most installs; consumed by
-    # scripts/oss_bakeoff.py (config#1659 Phase B shadow-canary) and by the
-    # ``llm`` flip surface once/if a session flips it to an openrouter spec.
-    # Absent for any install that hasn't provisioned it — never blocks boot.
+    # OpenRouter key — optional. Not needed for production generation once
+    # ``llm`` names a krepis router group (the router holds its own
+    # provider credentials) or by most installs; consumed by the OSS
+    # self-host legacy default and by the ``llm`` flip surface if a session
+    # pins an explicit openrouter spec. Absent for any install that hasn't
+    # provisioned it — never blocks boot.
     if not os.environ.get("OPENROUTER_API_KEY"):
         openrouter_key = fetch_optional("/morning-signal/openrouter-api-key")
         if openrouter_key:

@@ -4,17 +4,20 @@ name: Live API Smoke
 # suite cannot see (e.g. the 2026-05-26 server-tool ⊥ assistant-prefill
 # HTTP 400 that slipped past CI because tests mock messages.create()).
 #
+# Retired the live network dispatch to Anthropic on 2026-08-29 (Brian
+# ruling: "we shouldn't be using the anthropic api at all" — direct-
+# Anthropic API budget is $0; morning-signal-I165). tests/live_api_smoke.py
+# now builds the exact production payload shape and runs
+# krepis.anthropic_payload.validate_payload against it — a static,
+# deterministic, offline check that already covers the 2026-05-26 incident
+# class (that validator is the SAME producer-side chokepoint the krepis
+# anthropic transport runs at call-construction time). No secret, no
+# network call, no per-run cost, no fork-secret-gate special case needed —
+# every PR runs it, forks included.
+#
 # Triggers ONLY on PRs whose diff touches files that affect the payload
-# shape sent to Anthropic. Other PRs (test-only refactors, docs, CI
-# config unrelated to the smoke) skip this workflow entirely.
-#
-# Cost: one max_tokens=1 messages.create() call per smoke ≈ $0.001 per
-# triggered run. Negligible vs the cost of one silent-failed 5 AM cron.
-#
-# Secret gate: requires repo secret ANTHROPIC_API_KEY. Forks without
-# the secret get a clean skip (the script exits 0 when the env var is
-# unset) rather than a failing CI status, so external contributors can
-# still PR without bothering Brian for access.
+# shape. Other PRs (test-only refactors, docs, CI config unrelated to the
+# smoke) skip this workflow entirely.
 
 on:
   pull_request:
@@ -44,36 +47,12 @@ jobs:
       - name: Pre-install krepis (PyPI or git fallback)
         run: |
           python -m pip install --upgrade pip
-          pip install "krepis[anthropic]>=0.10.3" || \
-            pip install "krepis[anthropic] @ git+https://github.com/nousergon/krepis.git@main"
+          pip install "krepis>=0.10.3" || \
+            pip install "krepis @ git+https://github.com/nousergon/krepis.git@main"
 
       - name: Install package
         run: |
           pip install -e .
 
-      # alpha-engine-config-I7634: krepis>=0.59.15's LLMClient (session_dlp.py)
-      # fails every call closed without a gitleaks binary on PATH, and this
-      # job's Anthropic call in live_api_smoke.py goes through LLMClient. The
-      # pyproject ceiling (<0.49.0) keeps this job under the affected version
-      # today, but that ceiling is bumped manually and deliberately — the
-      # eventual bump should not also have to notice this prerequisite.
-      # Mirrors test.yml's step and krepis's own test.yml verbatim (same
-      # version/hash) — do not re-derive independently.
-      - name: Install gitleaks (for krepis DLP-gated calls)
-        run: |
-          set -euo pipefail
-          GITLEAKS_VERSION="8.30.1"
-          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-          curl -sSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
-          tar -xzf gitleaks.tar.gz gitleaks
-          chmod +x gitleaks
-          sudo mv gitleaks /usr/local/bin/gitleaks
-          gitleaks version
-          sudo mkdir -p /opt/groom-llm-routing
-          printf '[extend]\nuseDefault = true\n' | sudo tee /opt/groom-llm-routing/gitleaks-egress.toml > /dev/null
-
-      - name: Dispatch live-API smoke (max_tokens=1)
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Payload-shape smoke check (no network call, no credential)
         run: python tests/live_api_smoke.py

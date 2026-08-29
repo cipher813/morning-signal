@@ -61,6 +61,7 @@ def bakeoff_module(monkeypatch, tmp_path: Path):
     )
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-abc")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
+    monkeypatch.setenv("MORNING_SIGNAL_BAKEOFF_ALLOW_DIRECT_OPENROUTER", "1")
     monkeypatch.delenv("MORNING_SIGNAL_USE_SSM", raising=False)
     monkeypatch.chdir(tmp_path)
 
@@ -290,6 +291,47 @@ def test_main_fails_without_openrouter_key(bakeoff_module, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-06"])
     assert bakeoff_module.main() == 1
+
+
+# ── Direct-OpenRouter compliance gate (morning-signal-I165, 2026-08-29) ─────
+
+
+def test_main_refuses_direct_openrouter_dispatch_by_default(
+    bakeoff_module, monkeypatch
+):
+    """Without the explicit override, main() must refuse BEFORE the AWS/SSM
+    bootstrap and before any billed call — CANDIDATES address OpenRouter
+    directly (bare ModelSpec), which alpha-engine-config-I6367 and Brian's
+    2026-08-29 "no parallel setups, funnel through the krepis router" ruling
+    both forbid. The shipped systemd unit never sets the override, so this
+    is what actually governs the weekly scheduled run."""
+    monkeypatch.delenv("MORNING_SIGNAL_BAKEOFF_ALLOW_DIRECT_OPENROUTER", raising=False)
+
+    def _unreachable_ssm():
+        raise AssertionError(
+            "main() must refuse the direct-OpenRouter dispatch before ever "
+            "touching AWS/SSM, not merely before the LLM call"
+        )
+
+    monkeypatch.setattr(bakeoff_module, "_maybe_load_from_ssm", _unreachable_ssm)
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-06"])
+
+    assert bakeoff_module.main() == 1
+
+
+def test_main_allows_direct_openrouter_dispatch_with_explicit_override(
+    bakeoff_module, monkeypatch, tmp_path
+):
+    """The override is the deliberate, human-aware escape hatch for a
+    manual one-off — with it set, the comparison runs exactly as before."""
+    monkeypatch.setenv("MORNING_SIGNAL_BAKEOFF_ALLOW_DIRECT_OPENROUTER", "1")
+    monkeypatch.setattr(bakeoff_module, "LLMClient", _dispatcher(_all_pass_plan()))
+    log_dir = tmp_path / "bakeoff_out"
+    monkeypatch.setenv(bakeoff_module.BAKEOFF_LOG_DIR_ENV, str(log_dir))
+    monkeypatch.setattr(sys, "argv", ["oss_bakeoff.py", "--date", "2026-07-06", "--edition", "am"])
+
+    assert bakeoff_module.main() == 0
+    assert (log_dir / "2026-07-06-am.bakeoff.jsonl").exists()
 
 
 def test_main_writes_jsonl_on_success(bakeoff_module, monkeypatch, tmp_path):
