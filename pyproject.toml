@@ -32,7 +32,7 @@ dependencies = [
     "pyyaml>=6.0",
     "typer>=0.12.0",
     # Telegram-routed failure + healthy-completion pings.
-    "flow-doctor==0.15.2",
+    "flow-doctor==0.16.1",
     # The commodity utilities morning-signal uses (anthropic_payload, cost,
     # trading_calendar) live in the public MIT `krepis` foundation library.
     # morning-signal is MIT and depends down onto krepis (also MIT); the
