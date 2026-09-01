@@ -51,42 +51,34 @@ def test_step_check_aws_failure_without_creds(monkeypatch):
     assert "aws configure" in r.message.lower()
 
 
-# ── step_check_anthropic ─────────────────────────────────────────────────────
+# ── step_check_router ────────────────────────────────────────────────────────
 
 
-def test_step_check_anthropic_empty_key():
-    from morning_signal.init.wizard import step_check_anthropic
+def test_step_check_router_success(monkeypatch):
+    from morning_signal.init.wizard import step_check_router
 
-    assert step_check_anthropic("").ok is False
-    assert step_check_anthropic("   ").ok is False
+    fake_spec = MagicMock()
+    fake_route = {"route": "litellm_proxy"}
+    fake_router = MagicMock()
+    fake_router.resolve_group_spec.return_value = (fake_spec, fake_route)
+    monkeypatch.setitem(sys.modules, "krepis.router", fake_router)
 
-
-def test_step_check_anthropic_valid_key(monkeypatch):
-    from morning_signal.init.wizard import step_check_anthropic
-
-    fake_model = MagicMock(id="claude-test")
-    response = MagicMock(data=[fake_model])
-    client_inst = MagicMock()
-    client_inst.models.list.return_value = response
-    fake_anthropic = MagicMock()
-    fake_anthropic.Anthropic.return_value = client_inst
-    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
-    r = step_check_anthropic("sk-ant-test")
+    r = step_check_router()
     assert r.ok
-    assert r.detail["sample_model"] == "claude-test"
+    assert "med" in r.message
+    assert r.detail["route"] == fake_route
 
 
-def test_step_check_anthropic_rejected_key(monkeypatch):
-    from morning_signal.init.wizard import step_check_anthropic
+def test_step_check_router_unreachable(monkeypatch):
+    from morning_signal.init.wizard import step_check_router
 
-    client_inst = MagicMock()
-    client_inst.models.list.side_effect = Exception("401 Unauthorized")
-    fake_anthropic = MagicMock()
-    fake_anthropic.Anthropic.return_value = client_inst
-    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
-    r = step_check_anthropic("sk-ant-bad")
+    fake_router = MagicMock()
+    fake_router.resolve_group_spec.side_effect = RuntimeError("no route")
+    monkeypatch.setitem(sys.modules, "krepis.router", fake_router)
+
+    r = step_check_router()
     assert not r.ok
-    assert "rejected" in r.message.lower()
+    assert "unreachable" in r.message.lower()
 
 
 # ── step_create_bucket ───────────────────────────────────────────────────────
@@ -159,7 +151,8 @@ def test_step_write_config_writes_both_files(tmp_path):
     cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
     assert cfg["s3_bucket"] == "b"
     assert cfg["podcast"]["title"] == "Test"
-    assert cfg["claude_model"] == "claude-sonnet-4-6"
+    assert cfg["llm"] == {"provider": "router", "model": "med"}
+    assert cfg["fallback_llm"] == {"provider": "router", "model": "low"}
 
 
 def test_step_write_config_refuses_overwrite_without_force(tmp_path):
@@ -214,30 +207,9 @@ def test_step_write_config_unknown_preset_falls_back_to_blank(tmp_path):
     assert (tmp_path / "prompt.md").exists()
 
 
-# ── step_save_anthropic_key ──────────────────────────────────────────────────
-
-
-def test_step_save_anthropic_key_writes_chmod_600(tmp_path):
-    from morning_signal.init.wizard import step_save_anthropic_key
-
-    r = step_save_anthropic_key("sk-ant-abc", home=tmp_path)
-    assert r.ok
-    env_path = Path(r.detail["env_path"])
-    assert env_path.exists()
-    assert env_path.read_text() == "ANTHROPIC_API_KEY=sk-ant-abc\n"
-    # On POSIX, check the mode
-    if os.name == "posix":
-        mode = env_path.stat().st_mode & 0o777
-        assert mode == 0o600
-
-
-def test_step_save_anthropic_key_strips_whitespace(tmp_path):
-    from morning_signal.init.wizard import step_save_anthropic_key
-
-    step_save_anthropic_key("  sk-ant-xyz\n", home=tmp_path)
-    env_path = tmp_path / ".config" / "morning-signal" / ".env"
-    assert "sk-ant-xyz" in env_path.read_text()
-    assert env_path.read_text().count("\n") == 1  # no trailing whitespace
+# step_save_anthropic_key retired (alpha-engine-config-I9306): no
+# direct-provider credential is collected or persisted any more — see
+# step_check_router above.
 
 
 # ── step_install_scheduler ───────────────────────────────────────────────────
@@ -367,7 +339,6 @@ def test_run_happy_path_e2e(tmp_path, aws_env, monkeypatch):
     # Mock typer.prompt / typer.confirm by walking a scripted Q&A list.
     prompt_answers = iter(
         [
-            "sk-ant-test-key",                                 # API key
             "test-bucket-e2e",                                  # bucket name
             "us-west-2",                                        # region
             "Test Podcast",                                     # title
@@ -381,25 +352,16 @@ def test_run_happy_path_e2e(tmp_path, aws_env, monkeypatch):
     monkeypatch.setattr(wizard.typer, "confirm", lambda *a, **kw: False)  # skip smoke test
     monkeypatch.setattr(wizard.typer, "echo", lambda *a, **kw: None)
 
-    # Mock anthropic client to always succeed
-    fake_model = MagicMock(id="claude-test")
-    response = MagicMock(data=[fake_model])
-    client_inst = MagicMock()
-    client_inst.models.list.return_value = response
-    fake_anthropic = MagicMock()
-    fake_anthropic.Anthropic.return_value = client_inst
-    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
-
-    # Redirect Home so step_save_anthropic_key writes into tmp_path
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Mock krepis router to resolve cleanly
+    fake_router = MagicMock()
+    fake_router.resolve_group_spec.return_value = (MagicMock(), {"route": "litellm_proxy"})
+    monkeypatch.setitem(sys.modules, "krepis.router", fake_router)
 
     code = wizard.run(workdir=tmp_path)
     assert code == 0
     # config.yaml + prompt.md written
     assert (tmp_path / "config.yaml").exists()
     assert (tmp_path / "prompt.md").exists()
-    # Anthropic key file written
-    assert (tmp_path / ".config" / "morning-signal" / ".env").exists()
 
 
 @mock_aws
@@ -414,16 +376,14 @@ def test_run_aborts_on_aws_failure(tmp_path, monkeypatch):
 
 
 @mock_aws
-def test_run_aborts_on_anthropic_failure(tmp_path, aws_env, monkeypatch):
+def test_run_aborts_on_router_failure(tmp_path, aws_env, monkeypatch):
+    """If the krepis router is unreachable, run() returns non-zero early."""
     from morning_signal.init import wizard
 
-    monkeypatch.setattr(wizard.typer, "prompt", lambda *a, **kw: "sk-ant-bad")
     monkeypatch.setattr(wizard.typer, "echo", lambda *a, **kw: None)
 
-    client_inst = MagicMock()
-    client_inst.models.list.side_effect = Exception("401")
-    fake_anthropic = MagicMock()
-    fake_anthropic.Anthropic.return_value = client_inst
-    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    fake_router = MagicMock()
+    fake_router.resolve_group_spec.side_effect = RuntimeError("unreachable")
+    monkeypatch.setitem(sys.modules, "krepis.router", fake_router)
 
     assert wizard.run(workdir=tmp_path) == 1
