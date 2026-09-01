@@ -1,8 +1,11 @@
 """Interactive `morning-signal init` wizard.
 
 Walks a new user from a fresh clone (or pip install) to a working setup:
-AWS creds verified, Anthropic key tested, S3 bucket bootstrapped, config.yaml
-+ prompt.md written, scheduler installed, smoke-tested.
+AWS creds verified, krepis router connectivity checked, S3 bucket
+bootstrapped, config.yaml + prompt.md written, scheduler installed,
+smoke-tested. No direct-provider credential is collected or stored
+(alpha-engine-config-I9306, Brian's 2026-08-29 ruling): LLM calls route
+through the fleet's shared krepis router exclusively.
 
 Architecture: each step is a pure function taking explicit inputs and
 returning a result. The `run` orchestrator collects inputs via typer.prompt
@@ -13,7 +16,6 @@ to unit-test without mocking typer.prompt.
 from __future__ import annotations
 
 import json
-import os
 import platform
 import secrets
 import shutil
@@ -44,7 +46,6 @@ class WizardState:
     workdir: Path = field(default_factory=Path.cwd)
     aws_account_id: str = ""
     aws_user_arn: str = ""
-    anthropic_key: str = ""
     bucket_name: str = ""
     bucket_region: str = "us-west-2"
     base_url: str = ""
@@ -81,29 +82,39 @@ def step_check_aws() -> StepResult:
         )
 
 
-# ── Step 2: Anthropic key ────────────────────────────────────────────────────
+# ── Step 2: krepis router connectivity ───────────────────────────────────────
 
 
-def step_check_anthropic(api_key: str) -> StepResult:
-    """Validate an Anthropic API key by listing models.
+def step_check_router() -> StepResult:
+    """Verify the krepis router edge can resolve a model group.
 
-    Tests can pass any string; the real-network call is what catches typos.
-    A 401 or network failure surfaces as ok=False.
+    Replaces the pre-migration ``step_check_anthropic`` (validated a
+    user-pasted Anthropic API key). Brian's 2026-08-29 ruling
+    (alpha-engine-config-I9306/I9263): "we shouldn't be using the anthropic
+    api at all" — morning-signal has no direct-provider credential to
+    collect any more, so this step confirms the box can reach the
+    fleet-shared krepis router instead of prompting for a secret.
+    Tests monkeypatch ``krepis.router.resolve_group_spec``.
     """
-    if not api_key or not api_key.strip():
-        return StepResult(ok=False, message="Anthropic API key is empty.")
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key.strip(), max_retries=1)
-        # Cheapest validation call: list models.
-        models = client.models.list(limit=1)
-        return StepResult(
-            ok=True,
-            message="Anthropic key OK.",
-            detail={"sample_model": models.data[0].id if models.data else None},
-        )
+        from krepis.router import resolve_group_spec
+        _, route = resolve_group_spec("med", max_tokens=64)
     except Exception as e:
-        return StepResult(ok=False, message=f"Anthropic key rejected: {e}")
+        return StepResult(
+            ok=False,
+            message=(
+                "krepis router unreachable — could not resolve model group "
+                "'med'. morning-signal has no direct-provider fallback "
+                f"(alpha-engine-config-I9306); fix router connectivity "
+                f"before continuing.\nError: {e}"
+            ),
+        )
+    resolved_route = route.get("route") if isinstance(route, dict) else route
+    return StepResult(
+        ok=True,
+        message=f"krepis router OK (group 'med' resolved via {resolved_route!r}).",
+        detail={"route": route},
+    )
 
 
 # ── Step 3: S3 bucket bootstrap ──────────────────────────────────────────────
@@ -273,7 +284,12 @@ def step_write_config(state: WizardState, force: bool = False) -> StepResult:
             "polly_engine": "neural",
             "speed": 1.5,
         },
-        "claude_model": "claude-sonnet-4-6",
+        # krepis router groups (alpha-engine-config-I9306) — no direct
+        # provider credential; the box authenticates to the shared router
+        # edge, not this per-instance config. Replaces the pre-migration
+        # "claude_model": "claude-sonnet-4-6" default.
+        "llm": {"provider": "router", "model": "med"},
+        "fallback_llm": {"provider": "router", "model": "low"},
         "max_tokens": 8192,
         "feed_max_episodes": 90,
         "notifications": {
@@ -292,25 +308,7 @@ def step_write_config(state: WizardState, force: bool = False) -> StepResult:
     )
 
 
-# ── Step 5: Write secrets to ~/.config/morning-signal/.env ───────────────────
-
-
-def step_save_anthropic_key(api_key: str, home: Optional[Path] = None) -> StepResult:
-    """Persist the Anthropic key in ~/.config/morning-signal/.env (chmod 600)."""
-    home = home or Path.home()
-    cfg_dir = home / ".config" / "morning-signal"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    env_path = cfg_dir / ".env"
-    env_path.write_text(f"ANTHROPIC_API_KEY={api_key.strip()}\n")
-    os.chmod(env_path, 0o600)
-    return StepResult(
-        ok=True,
-        message=f"Anthropic key stored at {env_path} (chmod 600).",
-        detail={"env_path": str(env_path)},
-    )
-
-
-# ── Step 6: Scheduler installer ──────────────────────────────────────────────
+# ── Step 5: Scheduler installer ───────────────────────────────────────────────
 
 
 def _systemd_user_dir() -> Path:
@@ -509,17 +507,13 @@ def run(workdir: Optional[Path] = None) -> int:
     state.aws_account_id = r.detail["account"]
     state.aws_user_arn = r.detail["arn"]
 
-    # 2. Anthropic key
+    # 2. krepis router connectivity
     typer.echo("")
-    typer.echo("→ Step 2/7: Anthropic API key")
-    api_key = typer.prompt("  Paste your Anthropic API key (sk-ant-…)", hide_input=True)
-    r = step_check_anthropic(api_key)
+    typer.echo("→ Step 2/7: krepis router connectivity")
+    r = step_check_router()
     typer.echo(f"  {r.message}")
     if not r.ok:
         return 1
-    state.anthropic_key = api_key.strip()
-    r = step_save_anthropic_key(state.anthropic_key)
-    typer.echo(f"  {r.message}")
 
     # 3. S3 bucket
     typer.echo("")
